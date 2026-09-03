@@ -107,75 +107,175 @@ function getGeminiClient(): GoogleGenAI | null {
   });
 }
 
-// Resilient Heuristic Matcher & Pre-Scorer
+// Generic Semantic Similarity & Heuristic Pre-Filter
+// Calculates compatibility: Item Type / Category / Semantic Object is PRIMARY
+// Location, Color, and Date are strictly SUPPORTING EVIDENCE
 function calculateHeuristicMatch(lostItem: CampusItem, foundItem: CampusItem): {
   isMatch: boolean;
   matchLevel: "High" | "Medium" | "Low" | "None";
   score: number;
   reason: string;
   keyFactors: string[];
+  isCompatibleObject: boolean;
 } {
-  const color1 = (lostItem.color || "").toLowerCase();
-  const color2 = (foundItem.color || "").toLowerCase();
-  const loc1 = (lostItem.location || "").toLowerCase();
-  const loc2 = (foundItem.location || "").toLowerCase();
-  const catMatch = (lostItem.category || "").toLowerCase() === (foundItem.category || "").toLowerCase();
+  const normalize = (str: string) => (str || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").trim();
 
-  let score = 0;
-  const factors: string[] = [];
+  const name1 = normalize(lostItem.itemName);
+  const name2 = normalize(foundItem.itemName);
+  const cat1 = normalize(lostItem.category);
+  const cat2 = normalize(foundItem.category);
+  const desc1 = normalize(lostItem.description);
+  const desc2 = normalize(foundItem.description);
+  const color1 = normalize(lostItem.color);
+  const color2 = normalize(foundItem.color);
+  const loc1 = normalize(lostItem.location);
+  const loc2 = normalize(foundItem.location);
 
-  if (catMatch) {
-    score += 30;
-    factors.push(`Same Category: ${lostItem.category}`);
-  }
+  // Synonyms and semantic object clusters
+  const semanticClusters: string[][] = [
+    ["backpack", "bag", "schoolbag", "rucksack", "knapsack", "satchel"],
+    ["id", "id card", "badge", "identity card", "college id", "student id", "campus card"],
+    ["charger", "adapter", "power adapter", "charging cable", "power brick", "usb c", "power supply"],
+    ["phone", "mobile", "smartphone", "iphone", "android", "cellphone"],
+    ["laptop", "notebook", "macbook", "computer"],
+    ["wallet", "purse", "billfold", "money clip"],
+    ["earphones", "headphones", "airpods", "earbuds", "headset"],
+    ["bottle", "water bottle", "flask", "tumbler", "thermos"],
+    ["glasses", "spectacles", "sunglasses", "eyewear"],
+    ["watch", "smartwatch", "timepiece"],
+    ["keys", "keychain", "key fob"],
+    ["umbrella", "parasol"],
+    ["jacket", "hoodie", "sweater", "coat"],
+    ["book", "notebook", "textbook", "journal", "diary"]
+  ];
 
-  // Color check
-  if (color1 && color2 && color1 !== "not specified" && color2 !== "not specified") {
-    if (color1.includes(color2) || color2.includes(color1)) {
-      score += 25;
-      factors.push(`Matching color: ${lostItem.color}`);
-    }
-  }
+  const fullText1 = `${name1} ${cat1} ${desc1}`;
+  const fullText2 = `${name2} ${cat2} ${desc2}`;
 
-  // Location check
-  const locKeywords = ["canteen", "library", "cafeteria", "audi", "hall", "lab", "gym", "hostel", "ground", "parking", "gate"];
-  let locationMatched = false;
-  for (const kw of locKeywords) {
-    if (loc1.includes(kw) && loc2.includes(kw)) {
-      locationMatched = true;
-      score += 25;
-      factors.push(`Shared area: ${kw.charAt(0).toUpperCase() + kw.slice(1)}`);
+  // Check if both items belong to the same semantic object type
+  let semanticMatchFound = false;
+  for (const cluster of semanticClusters) {
+    const has1 = cluster.some(word => fullText1.includes(word));
+    const has2 = cluster.some(word => fullText2.includes(word));
+    if (has1 && has2) {
+      semanticMatchFound = true;
       break;
     }
   }
-  if (!locationMatched && (loc1.includes(loc2) || loc2.includes(loc1))) {
-    score += 20;
-    factors.push(`Proximity: ${lostItem.location}`);
+
+  // Check for common significant words (length > 2, excluding stopwords)
+  const stopWords = new Set(["the", "and", "with", "for", "near", "from", "that", "this", "left", "lost", "found", "item", "please", "room"]);
+  const words1 = name1.split(/\s+/).filter(w => w.length > 2 && !stopWords.has(w));
+  const words2 = name2.split(/\s+/).filter(w => w.length > 2 && !stopWords.has(w));
+  const commonNameWords = words1.filter(w => words2.includes(w));
+
+  const descWords1 = desc1.split(/\s+/).filter(w => w.length > 2 && !stopWords.has(w));
+  const descWords2 = desc2.split(/\s+/).filter(w => w.length > 2 && !stopWords.has(w));
+  const commonDescWords = descWords1.filter(w => descWords2.includes(w));
+
+  const sameCategory = (cat1 === cat2 && cat1 !== "other") ||
+                       cat1.includes(cat2) || cat2.includes(cat1);
+
+  // Is this a compatible physical object?
+  // If categories completely conflict and no semantic cluster matches and no key words match -> incompatible!
+  const isCompatibleObject = semanticMatchFound || sameCategory || commonNameWords.length > 0 || commonDescWords.length >= 2;
+
+  // If items are clearly different object types (e.g., ID card vs Charger, Water Bottle vs Adapter),
+  // they MUST NOT match, even if color or location match!
+  if (!isCompatibleObject) {
+    return {
+      isMatch: false,
+      matchLevel: "None",
+      score: 5,
+      reason: "The reported items are different types of objects.",
+      keyFactors: ["Different item types"],
+      isCompatibleObject: false
+    };
   }
 
-  // Name keyword check
-  const words1 = lostItem.itemName.toLowerCase().split(/\s+/).filter(w => w.length > 2);
-  const words2 = foundItem.itemName.toLowerCase().split(/\s+/).filter(w => w.length > 2);
-  const commonWords = words1.filter(w => words2.includes(w));
-  if (commonWords.length > 0) {
+  // Calculate generic relevance score
+  let score = 0;
+  const factors: string[] = [];
+
+  // Primary: Object type & category match (up to 45 points)
+  if (sameCategory) {
+    score += 30;
+    factors.push(`Matching category: ${lostItem.category}`);
+  }
+  if (semanticMatchFound) {
     score += 25;
-    factors.push(`Common keywords: ${commonWords.join(", ")}`);
+    factors.push(`Semantically matching item type`);
+  }
+  if (commonNameWords.length > 0) {
+    score += Math.min(20, commonNameWords.length * 10);
+    factors.push(`Common keywords: ${commonNameWords.join(", ")}`);
+  }
+  if (commonDescWords.length > 0) {
+    score += Math.min(15, commonDescWords.length * 5);
   }
 
-  score = Math.min(100, Math.max(10, score));
+  // Secondary Supporting Evidence 1: Color (up to 15 points)
+  const isGenericColor = (c: string) => !c || c === "not specified" || c === "other" || c === "none";
+  if (!isGenericColor(color1) && !isGenericColor(color2)) {
+    if (color1.includes(color2) || color2.includes(color1)) {
+      score += 15;
+      factors.push(`Matching color: ${lostItem.color}`);
+    } else {
+      // Conflicting colors reduce score slightly
+      score = Math.max(0, score - 10);
+    }
+  }
+
+  // Secondary Supporting Evidence 2: Location (up to 15 points)
+  if (loc1 && loc2) {
+    const locKeywords = ["canteen", "library", "cafeteria", "audi", "hall", "lab", "gym", "hostel", "ground", "parking", "gate", "class", "bench", "center"];
+    let locMatched = false;
+    for (const kw of locKeywords) {
+      if (loc1.includes(kw) && loc2.includes(kw)) {
+        locMatched = true;
+        score += 15;
+        factors.push(`Shared area: ${kw.charAt(0).toUpperCase() + kw.slice(1)}`);
+        break;
+      }
+    }
+    if (!locMatched && (loc1.includes(loc2) || loc2.includes(loc1))) {
+      score += 12;
+      factors.push(`Proximity: ${lostItem.location}`);
+    }
+  }
+
+  // Secondary Supporting Evidence 3: Date proximity (up to 10 points)
+  if (lostItem.date && foundItem.date) {
+    try {
+      const d1 = new Date(lostItem.date).getTime();
+      const d2 = new Date(foundItem.date).getTime();
+      const diffDays = Math.abs(d1 - d2) / (1000 * 60 * 60 * 24);
+      if (diffDays <= 1) {
+        score += 10;
+        factors.push("Reported around the same day");
+      } else if (diffDays <= 4) {
+        score += 5;
+        factors.push("Reported within a few days of each other");
+      }
+    } catch {
+      // Ignore date parse errors
+    }
+  }
+
+  score = Math.min(100, Math.max(0, score));
 
   let matchLevel: "High" | "Medium" | "Low" | "None" = "None";
-  let reason = "The reports differ in item details or campus location.";
+  let reason = "No strong match found.";
 
   if (score >= 75) {
     matchLevel = "High";
-    reason = `Both reports describe a ${lostItem.color || ""} ${lostItem.itemName.toLowerCase()} in the ${lostItem.location} area.`;
+    reason = `Strong correspondence between the lost and found ${lostItem.itemName.toLowerCase()} reports.`;
   } else if (score >= 50) {
     matchLevel = "Medium";
-    reason = `Similar ${lostItem.category} item reported with matching attributes or nearby campus location.`;
+    reason = `Possible match between reports with shared attributes and timing.`;
   } else if (score >= 30) {
     matchLevel = "Low";
-    reason = `Partial overlap in item category or campus location.`;
+    reason = `Low correspondence between reports.`;
   }
 
   return {
@@ -183,11 +283,12 @@ function calculateHeuristicMatch(lostItem: CampusItem, foundItem: CampusItem): {
     matchLevel,
     score,
     reason,
-    keyFactors: factors.length > 0 ? factors : ["Category comparison"],
+    keyFactors: factors.length > 0 ? factors : ["Item attribute evaluation"],
+    isCompatibleObject: true
   };
 }
 
-// AI Matching Function with fallback ladder
+// AI Matching Function using Gemini with Semantic Understanding
 async function compareItemsWithGemini(
   lostItem: CampusItem,
   foundItem: CampusItem
@@ -198,15 +299,40 @@ async function compareItemsWithGemini(
   reason: string;
   keyFactors: string[];
 }> {
+  // First evaluate deterministic rules
   const heuristic = calculateHeuristicMatch(lostItem, foundItem);
-  const ai = getGeminiClient();
 
-  if (!ai) {
-    return heuristic;
+  // If the items are completely incompatible objects, do NOT consider them a match
+  if (!heuristic.isCompatibleObject) {
+    return {
+      isMatch: false,
+      matchLevel: "None",
+      score: Math.min(15, heuristic.score),
+      reason: "No strong match found. The reports describe completely different types of items.",
+      keyFactors: ["Different item categories and physical object types"]
+    };
   }
 
-  const prompt = `You are the AI engine for 'FindBack AI - Smart Campus Lost & Found'.
-Compare these two campus reports to determine if they could represent the SAME item.
+  const ai = getGeminiClient();
+  if (!ai) {
+    return {
+      isMatch: heuristic.isMatch,
+      matchLevel: heuristic.matchLevel,
+      score: heuristic.score,
+      reason: heuristic.score >= 50 ? heuristic.reason : "No strong match found.",
+      keyFactors: heuristic.keyFactors
+    };
+  }
+
+  const prompt = `You are the AI matching engine for 'FindBack AI' (Campus Lost and Found).
+Evaluate whether the following LOST item report and FOUND item report refer to the SAME physical object.
+
+CRITICAL RULES:
+1. Object Type & Category are PRIMARY: Two completely different objects (such as an ID card vs a Charger, or a Water Bottle vs a Wallet) must NEVER match, even if they share the same color or location.
+2. Semantic Understanding: Recognize that users describe the SAME object with different terms (e.g. "school bag" == "backpack", "adapter" == "charger", "college ID" == "student ID card", "laptop" == "MacBook").
+3. Location, Color, and Date are strictly SUPPORTING EVIDENCE. They increase confidence for the same item type, but CANNOT make different items match.
+4. If there is no sufficiently relevant item, set isMatch: false, matchLevel: "None", score: 10-30, reason: "No strong match found."
+5. Only assign "High" (score >= 75) or "Medium" (score >= 50) when there is a genuine, high-probability correlation that these two reports describe the exact same physical belonging.
 
 REPORT 1 (LOST ITEM):
 - Name: "${lostItem.itemName}"
@@ -224,19 +350,13 @@ REPORT 2 (FOUND ITEM):
 - Location: "${foundItem.location}"
 - Date Reported Found: "${foundItem.date}"
 
-Instructions:
-1. Analyze item type, description, color, campus location proximity, dates, and distinguishing features.
-2. Produce an objective, friendly explanation clearly labeled as an AI-suggested match.
-3. Be realistic: If the items are completely different, matchLevel is "None" with score < 20.
-4. If they match closely, matchLevel is "High" with score >= 80.
-
-Respond ONLY with a JSON object adhering to this schema:
+Respond ONLY with this JSON schema:
 {
   "isMatch": boolean,
   "matchLevel": "High" | "Medium" | "Low" | "None",
   "score": number (0 to 100),
-  "reason": string (1-2 sentences explaining why they may or may not match),
-  "keyFactors": string[] (up to 4 bullet points of matching or contrasting factors)
+  "reason": string (concise explanation starting with 'Why this may be a match:' or 'No strong match found.'),
+  "keyFactors": string[] (2 to 4 bullet points of matching details or why they differ)
 }`;
 
   for (const model of FALLBACK_MODELS) {
@@ -246,35 +366,44 @@ Respond ONLY with a JSON object adhering to this schema:
         contents: prompt,
         config: {
           responseMimeType: "application/json",
-          temperature: 0.2,
+          temperature: 0.1,
         },
       });
 
-      // 3000ms timeout per attempt for responsive execution
       const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`Timeout for model ${model}`)), 3000)
+        setTimeout(() => reject(new Error(`Timeout for model ${model}`)), 4000)
       );
 
       const response = (await Promise.race([responsePromise, timeoutPromise])) as any;
 
       if (response && response.text) {
         const parsed = JSON.parse(response.text.trim());
+        const score = typeof parsed.score === "number" ? parsed.score : heuristic.score;
+        const matchLevel = parsed.matchLevel || (score >= 75 ? "High" : score >= 50 ? "Medium" : "None");
+        const isMatch = (matchLevel === "High" || matchLevel === "Medium") && score >= 50;
+
         return {
-          isMatch: Boolean(parsed.isMatch || parsed.matchLevel === "High" || parsed.matchLevel === "Medium"),
-          matchLevel: parsed.matchLevel || (heuristic.score >= 50 ? "Medium" : "Low"),
-          score: typeof parsed.score === "number" ? parsed.score : heuristic.score,
-          reason: parsed.reason || heuristic.reason,
+          isMatch,
+          matchLevel: isMatch ? matchLevel : "None",
+          score,
+          reason: isMatch ? (parsed.reason || heuristic.reason) : "No strong match found.",
           keyFactors: Array.isArray(parsed.keyFactors) && parsed.keyFactors.length > 0 ? parsed.keyFactors : heuristic.keyFactors,
         };
       }
     } catch (err: any) {
       console.warn(`Gemini model ${model} skipped or timed out:`, err?.message || err);
-      continue; // Try next model in ladder
+      continue;
     }
   }
 
-  // Gracefully return heuristic calculation if all models timed out
-  return heuristic;
+  // Graceful fallback
+  return {
+    isMatch: heuristic.isMatch,
+    matchLevel: heuristic.matchLevel,
+    score: heuristic.score,
+    reason: heuristic.score >= 50 ? heuristic.reason : "No strong match found.",
+    keyFactors: heuristic.keyFactors
+  };
 }
 
 // Fetch all items from Firestore
@@ -318,46 +447,24 @@ async function fetchMatchesFromFirestore(): Promise<ItemMatch[]> {
 
     snap.forEach((docSnap) => {
       const d = docSnap.data();
-      const lostItem = itemsMap.get(d.lostItemId) || {
-        id: d.lostItemId,
-        itemType: "lost",
-        itemName: "Lost Item",
-        category: "Other",
-        description: "Lost report",
-        color: "Not specified",
-        location: "Campus",
-        date: "Recent",
-        contact: "Campus",
-        status: "possible_match",
-        createdAt: d.createdAt || new Date().toISOString()
-      };
+      const lostItem = itemsMap.get(d.lostItemId);
+      const foundItem = itemsMap.get(d.foundItemId);
 
-      const foundItem = itemsMap.get(d.foundItemId) || {
-        id: d.foundItemId,
-        itemType: "found",
-        itemName: "Found Item",
-        category: "Other",
-        description: "Found report",
-        color: "Not specified",
-        location: "Campus",
-        date: "Recent",
-        contact: "Campus",
-        status: "possible_match",
-        createdAt: d.createdAt || new Date().toISOString()
-      };
-
-      matches.push({
-        id: docSnap.id,
-        lostItemId: d.lostItemId,
-        foundItemId: d.foundItemId,
-        lostItem,
-        foundItem,
-        matchLevel: d.matchLevel || "Medium",
-        score: typeof d.score === "number" ? d.score : 80,
-        reason: d.reason || "AI matched attributes between reports.",
-        keyFactors: Array.isArray(d.keyFactors) ? d.keyFactors : [],
-        createdAt: d.createdAt || new Date().toISOString()
-      });
+      // Only include matches where both real items currently exist in Firestore
+      if (lostItem && foundItem) {
+        matches.push({
+          id: docSnap.id,
+          lostItemId: d.lostItemId,
+          foundItemId: d.foundItemId,
+          lostItem,
+          foundItem,
+          matchLevel: d.matchLevel || "Medium",
+          score: typeof d.score === "number" ? d.score : 80,
+          reason: d.reason || "AI matched attributes between reports.",
+          keyFactors: Array.isArray(d.keyFactors) ? d.keyFactors : [],
+          createdAt: d.createdAt || new Date().toISOString()
+        });
+      }
     });
 
     matches.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
@@ -371,6 +478,8 @@ async function fetchMatchesFromFirestore(): Promise<ItemMatch[]> {
 // Evaluate a new item against existing items in Firestore using Gemini
 async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<ItemMatch[]> {
   const allItems = await fetchItemsFromFirestore();
+  // 1. When a LOST item is submitted, compare it ONLY with existing FOUND items.
+  // 2. When a FOUND item is submitted, compare it ONLY with existing LOST items.
   const oppositeType = newItem.itemType === "lost" ? "found" : "lost";
   const potentialMatches = allItems.filter(
     item => item.id !== newItem.id && item.itemType === oppositeType && item.status !== "returned"
@@ -380,7 +489,7 @@ async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<ItemMa
     return [];
   }
 
-  // Pre-filter candidates by heuristic score to evaluate top candidates
+  // Pre-filter candidates by compatibility and heuristic score
   const candidatesWithHeuristic = potentialMatches.map(candidate => {
     const lost = newItem.itemType === "lost" ? newItem : candidate;
     const found = newItem.itemType === "found" ? newItem : candidate;
@@ -388,10 +497,11 @@ async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<ItemMa
     return { candidate, lost, found, heuristic };
   });
 
+  // Keep all potentially compatible candidates
   const promisingCandidates = candidatesWithHeuristic
-    .filter(c => c.heuristic.score >= 20)
+    .filter(c => c.heuristic.isCompatibleObject || c.heuristic.score >= 25)
     .sort((a, b) => b.heuristic.score - a.heuristic.score)
-    .slice(0, 3); // Evaluate top 3 candidates
+    .slice(0, 5); // Evaluate top 5 compatible candidates
 
   if (promisingCandidates.length === 0) {
     return [];
@@ -403,7 +513,8 @@ async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<ItemMa
     try {
       const result = await compareItemsWithGemini(lost, found);
 
-      if (result.matchLevel === "High" || result.matchLevel === "Medium" || result.score >= 50) {
+      // Only show a match when the overall relevance passes a reasonable confidence threshold
+      if (result.isMatch && (result.matchLevel === "High" || result.matchLevel === "Medium") && result.score >= 50) {
         const matchId = `match-${lost.id}-${found.id}`.replace(/[^a-zA-Z0-9_\-]/g, "_");
         const matchRecord: ItemMatch = {
           id: matchId,
@@ -565,16 +676,18 @@ async function startServer() {
         createdAt: new Date().toISOString()
       };
 
-      // Save to Firestore
-      await setDoc(doc(db, "matches", matchId), sanitizePayload({
-        lostItemId: matchRecord.lostItemId,
-        foundItemId: matchRecord.foundItemId,
-        matchLevel: matchRecord.matchLevel,
-        score: matchRecord.score,
-        reason: matchRecord.reason,
-        keyFactors: matchRecord.keyFactors || [],
-        createdAt: matchRecord.createdAt
-      }));
+      // Only save to Firestore if it actually passes the match criteria
+      if (result.isMatch && (result.matchLevel === "High" || result.matchLevel === "Medium") && result.score >= 50) {
+        await setDoc(doc(db, "matches", matchId), sanitizePayload({
+          lostItemId: matchRecord.lostItemId,
+          foundItemId: matchRecord.foundItemId,
+          matchLevel: matchRecord.matchLevel,
+          score: matchRecord.score,
+          reason: matchRecord.reason,
+          keyFactors: matchRecord.keyFactors || [],
+          createdAt: matchRecord.createdAt
+        }));
+      }
 
       res.json({
         success: true,
