@@ -27,6 +27,13 @@ import { MatchModal } from './components/MatchModal';
 import { ItemCard } from './components/ItemCard';
 import { DemoScenarioBanner } from './components/DemoScenarioBanner';
 import { CampusItem, ItemMatch, ItemType, ItemStatus } from './types';
+import {
+  getItemsFromFirestore,
+  getMatchesFromFirestore,
+  updateItemStatusInFirestore,
+  subscribeToFirestoreItems,
+  subscribeToFirestoreMatches
+} from './lib/firebase';
 
 export default function App() {
   // Navigation
@@ -52,27 +59,20 @@ export default function App() {
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [locationFilter, setLocationFilter] = useState('all');
 
-  // Fetch Items and Matches from Backend
+  // Fetch Items and Matches directly from Firebase Firestore
   const fetchData = async () => {
     try {
       setErrorMessage(null);
-      const [itemsRes, matchesRes] = await Promise.all([
-        fetch('/api/items'),
-        fetch('/api/matches')
+      const [firestoreItems, firestoreMatches] = await Promise.all([
+        getItemsFromFirestore(),
+        getMatchesFromFirestore()
       ]);
 
-      const itemsJson = await itemsRes.json();
-      const matchesJson = await matchesRes.json();
-
-      if (itemsJson.success && Array.isArray(itemsJson.data)) {
-        setItems(itemsJson.data);
-      }
-      if (matchesJson.success && Array.isArray(matchesJson.data)) {
-        setMatches(matchesJson.data);
-      }
+      setItems(firestoreItems);
+      setMatches(firestoreMatches);
     } catch (err: any) {
-      console.error('Fetch error:', err);
-      setErrorMessage('Could not connect to the campus server. Please check your connection.');
+      console.error('Firestore connection error:', err);
+      setErrorMessage('Unable to connect to Cloud Firestore database. Please verify your connection.');
     } finally {
       setIsLoading(false);
       setIsRefreshing(false);
@@ -81,6 +81,35 @@ export default function App() {
 
   useEffect(() => {
     fetchData();
+
+    // Subscribe to real-time changes in Firestore
+    const unsubscribeItems = subscribeToFirestoreItems(
+      (updatedItems) => {
+        setItems(updatedItems);
+      },
+      (err) => {
+        console.warn('Real-time items sync error:', err);
+      }
+    );
+
+    const unsubscribeMatches = subscribeToFirestoreMatches(
+      async () => {
+        try {
+          const freshMatches = await getMatchesFromFirestore();
+          setMatches(freshMatches);
+        } catch (e) {
+          console.warn('Real-time matches sync error:', e);
+        }
+      },
+      (err) => {
+        console.warn('Real-time matches sync error:', err);
+      }
+    );
+
+    return () => {
+      unsubscribeItems();
+      unsubscribeMatches();
+    };
   }, []);
 
   const handleRefresh = () => {
@@ -96,46 +125,50 @@ export default function App() {
 
   // Handler when a new item is created
   const handleItemCreated = (newItem: CampusItem, newMatches: ItemMatch[]) => {
-    setItems(prev => [newItem, ...prev]);
+    setItems(prev => [newItem, ...prev.filter(i => i.id !== newItem.id)]);
     if (newMatches.length > 0) {
-      setMatches(prev => [...newMatches, ...prev]);
+      setMatches(prev => [...newMatches, ...prev.filter(m => !newMatches.some(nm => nm.id === m.id))]);
     }
   };
 
-  // Mark an item as Returned
+  // Mark an item as Returned in Cloud Firestore
   const handleMarkReturned = async (itemId: string) => {
     try {
-      const response = await fetch(`/api/items/${itemId}/status`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status: 'returned' })
-      });
-      const data = await response.json();
-      if (data.success) {
-        setItems(prev => prev.map(item => {
-          if (item.id === itemId) return { ...item, status: 'returned' };
-          if (item.matchedItemIds?.includes(itemId)) return { ...item, status: 'returned' };
-          return item;
-        }));
-      }
+      const currentItem = items.find(i => i.id === itemId);
+      const counterpartId = currentItem?.matchedItemIds?.[0];
+
+      // Update directly in Firestore
+      await updateItemStatusInFirestore(itemId, 'returned', counterpartId);
+
+      // Optimistically update local state
+      setItems(prev => prev.map(item => {
+        if (item.id === itemId || (counterpartId && item.id === counterpartId)) {
+          return { ...item, status: 'returned' };
+        }
+        return item;
+      }));
     } catch (err) {
-      console.error('Update status error:', err);
+      console.error('Update status in Firestore error:', err);
     }
   };
 
-  // Trigger Demo Scenario
+  // Trigger Demo Scenario (saves real demo items to Firestore & runs Gemini)
   const handleTriggerDemo = async () => {
     try {
+      setIsRefreshing(true);
       const response = await fetch('/api/seed-demo', { method: 'POST' });
       const data = await response.json();
       if (data.success) {
         await fetchData();
         if (data.data?.match) {
           setSelectedMatch(data.data.match);
+          setIsMatchModalOpen(true);
         }
       }
     } catch (err) {
       console.error('Demo error:', err);
+    } finally {
+      setIsRefreshing(false);
     }
   };
 

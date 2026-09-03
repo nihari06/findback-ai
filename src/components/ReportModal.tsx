@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { X, Sparkles, Upload, Image as ImageIcon, AlertCircle, CheckCircle2, ArrowRight, Loader2 } from 'lucide-react';
 import { ItemType, CampusItem, ItemMatch } from '../types';
+import { saveItemToFirestore } from '../lib/firebase';
 
 interface ReportModalProps {
   isOpen: boolean;
@@ -136,54 +137,58 @@ export const ReportModal: React.FC<ReportModalProps> = ({
 
     setIsSubmitting(true);
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 12000);
-
     try {
-      const response = await fetch('/api/items', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
-          itemType,
-          itemName: itemName.trim(),
-          category,
-          description: description.trim(),
-          color: color.trim() || 'Not specified',
-          location: location.trim(),
-          date,
-          imageUrl: imageUrl || undefined,
-          contact: contact.trim()
-        })
-      });
+      const itemId = `item-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+      const newItem: CampusItem = {
+        id: itemId,
+        itemType,
+        itemName: itemName.trim(),
+        category,
+        description: description.trim(),
+        color: color.trim() || 'Not specified',
+        location: location.trim(),
+        date,
+        imageUrl: imageUrl || undefined,
+        contact: contact.trim(),
+        status: itemType,
+        createdAt: new Date().toISOString(),
+        matchedItemIds: []
+      };
 
-      clearTimeout(timeoutId);
+      // 1. Direct save to Cloud Firestore
+      await saveItemToFirestore(newItem);
 
-      const result = await response.json();
-
-      if (!response.ok || !result.success) {
-        throw new Error(result.error || 'Failed to submit report');
+      // 2. Evaluate with Google Gemini via secure backend route
+      let matches: ItemMatch[] = [];
+      try {
+        const evalRes = await fetch('/api/matches/evaluate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ item: newItem })
+        });
+        const evalData = await evalRes.json();
+        if (evalData.success && evalData.data?.matches) {
+          matches = evalData.data.matches;
+          if (matches.length > 0) {
+            newItem.status = 'possible_match';
+            newItem.matchedItemIds = matches.map(m => m.lostItemId === newItem.id ? m.foundItemId : m.lostItemId);
+          }
+        }
+      } catch (aiErr) {
+        console.warn('Gemini evaluation notice:', aiErr);
       }
 
-      const createdItem: CampusItem = result.data.item;
-      const matches: ItemMatch[] = result.data.matches || [];
-
       // Pass back to parent dashboard
-      onItemCreated(createdItem, matches);
+      onItemCreated(newItem, matches);
 
       // Transition to clear, confirmed "Submitted" state
       setSubmittedResult({
-        item: createdItem,
+        item: newItem,
         matches
       });
     } catch (err: any) {
-      clearTimeout(timeoutId);
       console.error('Submit error:', err);
-      if (err.name === 'AbortError') {
-        setErrorMessage('The request took longer than expected. Please check your network and try again.');
-      } else {
-        setErrorMessage(err.message || 'Something went wrong. Please check your network and try again.');
-      }
+      setErrorMessage(err.message || 'Could not save report to Cloud Firestore. Please check your connection.');
     } finally {
       setIsSubmitting(false);
     }

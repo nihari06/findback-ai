@@ -84,16 +84,51 @@ Ensure the `firestore.rules` file is deployed to enforce owner-bound security an
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+
+    // Default deny all access
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidItem(data) {
+      return data.itemType in ['lost', 'found'] &&
+             data.itemName is string && data.itemName.size() >= 2 && data.itemName.size() <= 100 &&
+             data.category is string && data.category.size() <= 50 &&
+             data.description is string && data.description.size() >= 5 && data.description.size() <= 1000 &&
+             data.color is string && data.color.size() <= 50 &&
+             data.location is string && data.location.size() >= 2 && data.location.size() <= 150 &&
+             data.date is string && data.date.size() <= 20 &&
+             data.contact is string && data.contact.size() >= 3 && data.contact.size() <= 150 &&
+             data.status in ['lost', 'found', 'possible_match', 'returned'];
+    }
+
+    function isValidMatch(data) {
+      return data.lostItemId is string && data.lostItemId.size() <= 128 &&
+             data.foundItemId is string && data.foundItemId.size() <= 128 &&
+             data.matchLevel in ['High', 'Medium', 'Low', 'None'] &&
+             data.reason is string && data.reason.size() <= 1000;
+    }
+
+    // Items collection
     match /items/{itemId} {
-      allow read: if true;
-      allow create: if request.resource.data.itemName is string
-                    && request.resource.data.itemType in ['lost', 'found'];
-      allow update: if request.resource.data.status in ['lost', 'found', 'possible_match', 'returned'];
+      allow get: if isValidId(itemId);
+      allow list: if true;
+      allow create: if isValidId(itemId) && isValidItem(request.resource.data);
+      allow update: if isValidId(itemId) && isValidItem(request.resource.data);
       allow delete: if false;
     }
+
+    // Matches collection
     match /matches/{matchId} {
-      allow read: if true;
-      allow write: if false; // Server-side authored only
+      allow get: if isValidId(matchId);
+      allow list: if true;
+      allow create: if isValidId(matchId) && isValidMatch(request.resource.data);
+      allow update: if isValidId(matchId) && isValidMatch(request.resource.data);
+      allow delete: if false;
     }
   }
 }

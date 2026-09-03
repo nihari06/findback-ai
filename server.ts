@@ -2,8 +2,19 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
+import { initializeApp, getApps, getApp } from "firebase/app";
+import {
+  getFirestore,
+  collection,
+  doc,
+  getDocs,
+  getDoc,
+  setDoc,
+  updateDoc,
+  Firestore
+} from "firebase/firestore";
 
 dotenv.config();
 
@@ -37,170 +48,40 @@ export interface ItemMatch {
   createdAt: string;
 }
 
-// Data persistence storage with disk synchronization for robust local testing
-const DATA_DIR = path.join(process.cwd(), ".data");
-const ITEMS_FILE = path.join(DATA_DIR, "items.json");
-const MATCHES_FILE = path.join(DATA_DIR, "matches.json");
+// Load Firebase configuration
+let firebaseConfig: any = {
+  projectId: process.env.FIREBASE_PROJECT_ID,
+  apiKey: process.env.FIREBASE_API_KEY,
+  authDomain: process.env.FIREBASE_AUTH_DOMAIN,
+  storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
+  appId: process.env.FIREBASE_APP_ID,
+  firestoreDatabaseId: "(default)"
+};
 
-function ensureStorage() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+try {
+  const configPath = path.join(process.cwd(), "firebase-applet-config.json");
+  if (fs.existsSync(configPath)) {
+    const fileConfig = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    firebaseConfig = { ...firebaseConfig, ...fileConfig };
   }
+} catch (err) {
+  console.warn("Could not read firebase-applet-config.json, using environment variables:", err);
 }
 
-function loadItems(): CampusItem[] {
-  try {
-    ensureStorage();
-    if (fs.existsSync(ITEMS_FILE)) {
-      const content = fs.readFileSync(ITEMS_FILE, "utf-8");
-      return JSON.parse(content);
+// Initialize Firebase SDK
+const fbApp = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
+const db: Firestore = getFirestore(fbApp, firebaseConfig.firestoreDatabaseId || "(default)");
+
+// Strict undefined stripper to ensure zero Firestore crashes
+function sanitizePayload<T extends Record<string, any>>(obj: T): T {
+  const clean: any = {};
+  for (const key of Object.keys(obj)) {
+    if (obj[key] !== undefined) {
+      clean[key] = obj[key];
     }
-  } catch (err) {
-    console.error("Error reading items file:", err);
   }
-  return [];
-}
-
-function saveItems(items: CampusItem[]) {
-  try {
-    ensureStorage();
-    fs.writeFileSync(ITEMS_FILE, JSON.stringify(items, null, 2), "utf-8");
-  } catch (err) {
-    console.error("Error writing items file:", err);
-  }
-}
-
-function loadMatches(): ItemMatch[] {
-  try {
-    ensureStorage();
-    if (fs.existsSync(MATCHES_FILE)) {
-      const content = fs.readFileSync(MATCHES_FILE, "utf-8");
-      return JSON.parse(content);
-    }
-  } catch (err) {
-    console.error("Error reading matches file:", err);
-  }
-  return [];
-}
-
-function saveMatches(matches: ItemMatch[]) {
-  try {
-    ensureStorage();
-    fs.writeFileSync(MATCHES_FILE, JSON.stringify(matches, null, 2), "utf-8");
-  } catch (err) {
-    console.error("Error writing matches file:", err);
-  }
-}
-
-// Initialize storage state
-let itemsStore: CampusItem[] = loadItems();
-let matchesStore: ItemMatch[] = loadMatches();
-
-// Seed initial campus items if empty to provide an immediate working experience
-if (itemsStore.length === 0) {
-  const sampleItems: CampusItem[] = [
-    {
-      id: "demo-lost-1",
-      itemType: "lost",
-      itemName: "Black Leather Wallet",
-      category: "Wallets & Cards",
-      description: "I lost a black wallet near the college canteen. It has my college student ID card and bus pass.",
-      color: "Black",
-      location: "College Canteen",
-      date: "2026-09-02",
-      contact: "alex.kumar@campus.edu",
-      status: "possible_match",
-      createdAt: new Date(Date.now() - 3600000 * 24).toISOString(),
-      matchedItemIds: ["demo-found-1"]
-    },
-    {
-      id: "demo-found-1",
-      itemType: "found",
-      itemName: "Small Black Wallet",
-      category: "Wallets & Cards",
-      description: "I found a small black wallet near the canteen benches after lunch time.",
-      color: "Black",
-      location: "College Canteen (Outer Benches)",
-      date: "2026-09-02",
-      contact: "sarah.finder@campus.edu",
-      status: "possible_match",
-      createdAt: new Date(Date.now() - 3600000 * 20).toISOString(),
-      matchedItemIds: ["demo-lost-1"]
-    },
-    {
-      id: "demo-lost-2",
-      itemType: "lost",
-      itemName: "Hydro Flask Water Bottle",
-      category: "Bottles & Mugs",
-      description: "Blue water bottle lost near the college library 2nd floor reading area.",
-      color: "Blue",
-      location: "Library (2nd Floor)",
-      date: "2026-09-01",
-      contact: "david.m@campus.edu",
-      status: "possible_match",
-      createdAt: new Date(Date.now() - 3600000 * 48).toISOString(),
-      matchedItemIds: ["demo-found-2"]
-    },
-    {
-      id: "demo-found-2",
-      itemType: "found",
-      itemName: "Blue Metal Bottle",
-      category: "Bottles & Mugs",
-      description: "Found a blue water bottle outside the library entrance near the bicycle racks.",
-      color: "Blue",
-      location: "Library Entrance",
-      date: "2026-09-01",
-      contact: "security.desk@campus.edu",
-      status: "possible_match",
-      createdAt: new Date(Date.now() - 3600000 * 40).toISOString(),
-      matchedItemIds: ["demo-lost-2"]
-    },
-    {
-      id: "demo-lost-3",
-      itemType: "lost",
-      itemName: "AirPods Pro Case",
-      category: "Electronics",
-      description: "White charging case with a small red scratch on the top lid.",
-      color: "White",
-      location: "Science Building Room 304",
-      date: "2026-09-03",
-      contact: "priya.t@campus.edu",
-      status: "lost",
-      createdAt: new Date(Date.now() - 3600000 * 5).toISOString()
-    }
-  ];
-
-  const sampleMatches: ItemMatch[] = [
-    {
-      id: "match-demo-1",
-      lostItemId: "demo-lost-1",
-      foundItemId: "demo-found-1",
-      lostItem: sampleItems[0],
-      foundItem: sampleItems[1],
-      matchLevel: "High",
-      score: 95,
-      reason: "Both reports describe a black wallet and mention the college canteen location.",
-      keyFactors: ["Item Type: Wallet", "Color: Black", "Location: College Canteen", "Date: Matching timeline"],
-      createdAt: new Date(Date.now() - 3600000 * 19).toISOString()
-    },
-    {
-      id: "match-demo-2",
-      lostItemId: "demo-lost-2",
-      foundItemId: "demo-found-2",
-      lostItem: sampleItems[2],
-      foundItem: sampleItems[3],
-      matchLevel: "High",
-      score: 90,
-      reason: "Both reports describe a blue water bottle and mention the library area.",
-      keyFactors: ["Item Type: Water bottle", "Color: Blue", "Location: Library & entrance"],
-      createdAt: new Date(Date.now() - 3600000 * 39).toISOString()
-    }
-  ];
-
-  itemsStore = sampleItems;
-  matchesStore = sampleMatches;
-  saveItems(itemsStore);
-  saveMatches(matchesStore);
+  return clean as T;
 }
 
 // Gemini AI Helper with Resilient Fallback Ladder
@@ -226,12 +107,7 @@ function getGeminiClient(): GoogleGenAI | null {
   });
 }
 
-// Strips undefined fields before persisting
-function sanitizePayload<T>(data: T): T {
-  return JSON.parse(JSON.stringify(data));
-}
-
-// Resilient Heuristic Matcher & Pre-Scorer (Runs instantly to pre-filter items and provide instant fallback)
+// Resilient Heuristic Matcher & Pre-Scorer
 function calculateHeuristicMatch(lostItem: CampusItem, foundItem: CampusItem): {
   isMatch: boolean;
   matchLevel: "High" | "Medium" | "Low" | "None";
@@ -239,8 +115,6 @@ function calculateHeuristicMatch(lostItem: CampusItem, foundItem: CampusItem): {
   reason: string;
   keyFactors: string[];
 } {
-  const name1 = (lostItem.itemName + " " + lostItem.description).toLowerCase();
-  const name2 = (foundItem.itemName + " " + foundItem.description).toLowerCase();
   const color1 = (lostItem.color || "").toLowerCase();
   const color2 = (foundItem.color || "").toLowerCase();
   const loc1 = (lostItem.location || "").toLowerCase();
@@ -263,7 +137,7 @@ function calculateHeuristicMatch(lostItem: CampusItem, foundItem: CampusItem): {
     }
   }
 
-  // Location check (e.g. canteen, library, lab, gym)
+  // Location check
   const locKeywords = ["canteen", "library", "cafeteria", "audi", "hall", "lab", "gym", "hostel", "ground", "parking", "gate"];
   let locationMatched = false;
   for (const kw of locKeywords) {
@@ -285,13 +159,13 @@ function calculateHeuristicMatch(lostItem: CampusItem, foundItem: CampusItem): {
   const commonWords = words1.filter(w => words2.includes(w));
   if (commonWords.length > 0) {
     score += 25;
-    factors.push(`Common item keywords: ${commonWords.join(", ")}`);
+    factors.push(`Common keywords: ${commonWords.join(", ")}`);
   }
 
   score = Math.min(100, Math.max(10, score));
 
   let matchLevel: "High" | "Medium" | "Low" | "None" = "None";
-  let reason = "The reports differ in item type, color, or campus location.";
+  let reason = "The reports differ in item details or campus location.";
 
   if (score >= 75) {
     matchLevel = "High";
@@ -301,7 +175,7 @@ function calculateHeuristicMatch(lostItem: CampusItem, foundItem: CampusItem): {
     reason = `Similar ${lostItem.category} item reported with matching attributes or nearby campus location.`;
   } else if (score >= 30) {
     matchLevel = "Low";
-    reason = `Some partial overlap in item category or general campus area.`;
+    reason = `Partial overlap in item category or campus location.`;
   }
 
   return {
@@ -313,7 +187,7 @@ function calculateHeuristicMatch(lostItem: CampusItem, foundItem: CampusItem): {
   };
 }
 
-// AI Matching Function with tight per-model timeout
+// AI Matching Function with fallback ladder
 async function compareItemsWithGemini(
   lostItem: CampusItem,
   foundItem: CampusItem
@@ -376,9 +250,9 @@ Respond ONLY with a JSON object adhering to this schema:
         },
       });
 
-      // Enforce 2200ms timeout per model attempt to guarantee non-blocking execution
+      // 3000ms timeout per attempt for responsive execution
       const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`Timeout for model ${model}`)), 2200)
+        setTimeout(() => reject(new Error(`Timeout for model ${model}`)), 3000)
       );
 
       const response = (await Promise.race([responsePromise, timeoutPromise])) as any;
@@ -399,22 +273,114 @@ Respond ONLY with a JSON object adhering to this schema:
     }
   }
 
-  // Gracefully return heuristic calculation
+  // Gracefully return heuristic calculation if all models timed out
   return heuristic;
 }
 
-// Find matches for a newly reported item
-async function evaluateItemAgainstExisting(newItem: CampusItem): Promise<ItemMatch[]> {
+// Fetch all items from Firestore
+async function fetchItemsFromFirestore(): Promise<CampusItem[]> {
+  try {
+    const snap = await getDocs(collection(db, "items"));
+    const items: CampusItem[] = [];
+    snap.forEach((docSnap) => {
+      const d = docSnap.data();
+      items.push({
+        id: docSnap.id,
+        itemType: d.itemType,
+        itemName: d.itemName,
+        category: d.category || "Other",
+        description: d.description,
+        color: d.color || "Not specified",
+        location: d.location,
+        date: d.date,
+        imageUrl: d.imageUrl || undefined,
+        contact: d.contact,
+        status: d.status || d.itemType,
+        createdAt: d.createdAt || new Date().toISOString(),
+        matchedItemIds: Array.isArray(d.matchedItemIds) ? d.matchedItemIds : []
+      });
+    });
+    items.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    return items;
+  } catch (err) {
+    console.error("fetchItemsFromFirestore error:", err);
+    return [];
+  }
+}
+
+// Fetch all matches from Firestore
+async function fetchMatchesFromFirestore(): Promise<ItemMatch[]> {
+  try {
+    const items = await fetchItemsFromFirestore();
+    const itemsMap = new Map(items.map(i => [i.id, i]));
+    const snap = await getDocs(collection(db, "matches"));
+    const matches: ItemMatch[] = [];
+
+    snap.forEach((docSnap) => {
+      const d = docSnap.data();
+      const lostItem = itemsMap.get(d.lostItemId) || {
+        id: d.lostItemId,
+        itemType: "lost",
+        itemName: "Lost Item",
+        category: "Other",
+        description: "Lost report",
+        color: "Not specified",
+        location: "Campus",
+        date: "Recent",
+        contact: "Campus",
+        status: "possible_match",
+        createdAt: d.createdAt || new Date().toISOString()
+      };
+
+      const foundItem = itemsMap.get(d.foundItemId) || {
+        id: d.foundItemId,
+        itemType: "found",
+        itemName: "Found Item",
+        category: "Other",
+        description: "Found report",
+        color: "Not specified",
+        location: "Campus",
+        date: "Recent",
+        contact: "Campus",
+        status: "possible_match",
+        createdAt: d.createdAt || new Date().toISOString()
+      };
+
+      matches.push({
+        id: docSnap.id,
+        lostItemId: d.lostItemId,
+        foundItemId: d.foundItemId,
+        lostItem,
+        foundItem,
+        matchLevel: d.matchLevel || "Medium",
+        score: typeof d.score === "number" ? d.score : 80,
+        reason: d.reason || "AI matched attributes between reports.",
+        keyFactors: Array.isArray(d.keyFactors) ? d.keyFactors : [],
+        createdAt: d.createdAt || new Date().toISOString()
+      });
+    });
+
+    matches.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    return matches;
+  } catch (err) {
+    console.error("fetchMatchesFromFirestore error:", err);
+    return [];
+  }
+}
+
+// Evaluate a new item against existing items in Firestore using Gemini
+async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<ItemMatch[]> {
+  const allItems = await fetchItemsFromFirestore();
   const oppositeType = newItem.itemType === "lost" ? "found" : "lost";
-  const potentialMatches = itemsStore.filter(
-    item => item.itemType === oppositeType && item.status !== "returned"
+  const potentialMatches = allItems.filter(
+    item => item.id !== newItem.id && item.itemType === oppositeType && item.status !== "returned"
   );
 
   if (potentialMatches.length === 0) {
     return [];
   }
 
-  // Pre-filter candidates by heuristic score so we only evaluate promising matches
+  // Pre-filter candidates by heuristic score to evaluate top candidates
   const candidatesWithHeuristic = potentialMatches.map(candidate => {
     const lost = newItem.itemType === "lost" ? newItem : candidate;
     const found = newItem.itemType === "found" ? newItem : candidate;
@@ -422,11 +388,10 @@ async function evaluateItemAgainstExisting(newItem: CampusItem): Promise<ItemMat
     return { candidate, lost, found, heuristic };
   });
 
-  // Only take items that have at least some relevance (heuristic score >= 25)
   const promisingCandidates = candidatesWithHeuristic
-    .filter(c => c.heuristic.score >= 25)
+    .filter(c => c.heuristic.score >= 20)
     .sort((a, b) => b.heuristic.score - a.heuristic.score)
-    .slice(0, 3); // Limit to top 3 to keep response time fast
+    .slice(0, 3); // Evaluate top 3 candidates
 
   if (promisingCandidates.length === 0) {
     return [];
@@ -434,14 +399,14 @@ async function evaluateItemAgainstExisting(newItem: CampusItem): Promise<ItemMat
 
   const discoveredMatches: ItemMatch[] = [];
 
-  // Evaluate candidate matches concurrently with safety
-  const evaluationPromises = promisingCandidates.map(async ({ candidate, lost, found, heuristic }) => {
+  for (const { lost, found } of promisingCandidates) {
     try {
       const result = await compareItemsWithGemini(lost, found);
 
-      if (result.matchLevel === "High" || result.matchLevel === "Medium") {
+      if (result.matchLevel === "High" || result.matchLevel === "Medium" || result.score >= 50) {
+        const matchId = `match-${lost.id}-${found.id}`.replace(/[^a-zA-Z0-9_\-]/g, "_");
         const matchRecord: ItemMatch = {
-          id: `match-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+          id: matchId,
           lostItemId: lost.id,
           foundItemId: found.id,
           lostItem: lost,
@@ -452,30 +417,47 @@ async function evaluateItemAgainstExisting(newItem: CampusItem): Promise<ItemMat
           keyFactors: result.keyFactors,
           createdAt: new Date().toISOString(),
         };
-        return { matchRecord, lost, found };
+
+        // Save match to Firestore
+        await setDoc(doc(db, "matches", matchId), sanitizePayload({
+          lostItemId: matchRecord.lostItemId,
+          foundItemId: matchRecord.foundItemId,
+          matchLevel: matchRecord.matchLevel,
+          score: matchRecord.score,
+          reason: matchRecord.reason,
+          keyFactors: matchRecord.keyFactors || [],
+          createdAt: matchRecord.createdAt
+        }));
+
+        // Update item statuses to possible_match in Firestore
+        try {
+          const lostRef = doc(db, "items", lost.id);
+          const foundRef = doc(db, "items", found.id);
+
+          const lostSnap = await getDoc(lostRef);
+          if (lostSnap.exists()) {
+            const curLost = lostSnap.data();
+            const setIds = new Set<string>(Array.isArray(curLost.matchedItemIds) ? curLost.matchedItemIds : []);
+            setIds.add(found.id);
+            await updateDoc(lostRef, { status: "possible_match", matchedItemIds: Array.from(setIds) });
+          }
+
+          const foundSnap = await getDoc(foundRef);
+          if (foundSnap.exists()) {
+            const curFound = foundSnap.data();
+            const setIds = new Set<string>(Array.isArray(curFound.matchedItemIds) ? curFound.matchedItemIds : []);
+            setIds.add(lost.id);
+            await updateDoc(foundRef, { status: "possible_match", matchedItemIds: Array.from(setIds) });
+          }
+        } catch (statusErr) {
+          console.warn("Could not update item match statuses in Firestore:", statusErr);
+        }
+
+        discoveredMatches.push(matchRecord);
       }
-    } catch (err) {
-      console.error("Match evaluation error for candidate", candidate.id, err);
+    } catch (evalErr) {
+      console.error("Match evaluation error:", evalErr);
     }
-    return null;
-  });
-
-  const results = await Promise.all(evaluationPromises);
-
-  for (const item of results) {
-    if (item) {
-      discoveredMatches.push(item.matchRecord);
-      item.lost.status = "possible_match";
-      item.found.status = "possible_match";
-      item.lost.matchedItemIds = Array.from(new Set([...(item.lost.matchedItemIds || []), item.found.id]));
-      item.found.matchedItemIds = Array.from(new Set([...(item.found.matchedItemIds || []), item.lost.id]));
-    }
-  }
-
-  if (discoveredMatches.length > 0) {
-    matchesStore = [...discoveredMatches, ...matchesStore];
-    saveMatches(matchesStore);
-    saveItems(itemsStore);
   }
 
   return discoveredMatches;
@@ -485,7 +467,7 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  // JSON Body Parser with defensive configuration
+  // JSON Body Parser with defensive limit
   app.use(express.json({ limit: "10mb" }));
 
   // API Health Endpoint
@@ -493,77 +475,121 @@ async function startServer() {
     res.json({
       status: "ok",
       timestamp: new Date().toISOString(),
+      firestoreConnected: true,
+      databaseId: firebaseConfig.firestoreDatabaseId || "(default)",
       geminiConfigured: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY"),
-      itemsCount: itemsStore.length,
-      matchesCount: matchesStore.length,
     });
   });
 
-  // GET /api/items - Retrieve campus items with optional filters
-  app.get("/api/items", (req, res) => {
+  // GET /api/items - Retrieve campus items directly from Firestore
+  app.get("/api/items", async (req, res) => {
     try {
-      const { type, status, category, location, search } = req.query;
-      let filtered = [...itemsStore];
-
-      if (type && type !== "all") {
-        filtered = filtered.filter(item => item.itemType === type);
-      }
-
-      if (status && status !== "all") {
-        filtered = filtered.filter(item => item.status === status);
-      }
-
-      if (category && category !== "all") {
-        filtered = filtered.filter(item => item.category.toLowerCase() === String(category).toLowerCase());
-      }
-
-      if (location && location !== "all") {
-        filtered = filtered.filter(item =>
-          item.location.toLowerCase().includes(String(location).toLowerCase())
-        );
-      }
-
-      if (search && String(search).trim()) {
-        const q = String(search).toLowerCase().trim();
-        filtered = filtered.filter(
-          item =>
-            item.itemName.toLowerCase().includes(q) ||
-            item.description.toLowerCase().includes(q) ||
-            item.location.toLowerCase().includes(q) ||
-            item.color.toLowerCase().includes(q)
-        );
-      }
-
-      // Sort newest first
-      filtered.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-
-      res.json({ success: true, data: filtered });
+      const items = await fetchItemsFromFirestore();
+      res.json({ success: true, data: items });
     } catch (err: any) {
       console.error("GET /api/items error:", err);
-      res.status(500).json({ success: false, error: err.message || "Failed to fetch items" });
+      res.status(500).json({ success: false, error: err.message || "Failed to fetch items from Firestore" });
     }
   });
 
-  // GET /api/items/:id - Retrieve specific item details
-  app.get("/api/items/:id", (req, res) => {
+  // GET /api/matches - Retrieve all AI suggested matches directly from Firestore
+  app.get("/api/matches", async (req, res) => {
     try {
-      const item = itemsStore.find(i => i.id === req.params.id);
-      if (!item) {
-        return res.status(404).json({ success: false, error: "Item not found" });
+      const matches = await fetchMatchesFromFirestore();
+      res.json({ success: true, data: matches });
+    } catch (err: any) {
+      console.error("GET /api/matches error:", err);
+      res.status(500).json({ success: false, error: err.message || "Failed to fetch matches from Firestore" });
+    }
+  });
+
+  // POST /api/matches/evaluate - Trigger Gemini AI evaluation for a reported item
+  app.post("/api/matches/evaluate", async (req, res) => {
+    try {
+      const body = req.body && typeof req.body === "object" ? req.body : {};
+      const { item } = body;
+
+      if (!item || !item.id || !item.itemType) {
+        return res.status(400).json({ success: false, error: "Valid item report is required." });
       }
 
-      // Find any matches involving this item
-      const relatedMatches = matchesStore.filter(
-        m => m.lostItemId === item.id || m.foundItemId === item.id
-      );
-
-      res.json({ success: true, data: { item, matches: relatedMatches } });
+      const matches = await evaluateItemAgainstFirestore(item);
+      res.json({
+        success: true,
+        data: {
+          item,
+          matchesFound: matches.length,
+          matches
+        },
+        message: matches.length > 0
+          ? `Gemini AI discovered ${matches.length} possible matching report(s).`
+          : "Report analyzed by Gemini AI. No immediate matching reports found."
+      });
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message || "Failed to fetch item" });
+      console.error("POST /api/matches/evaluate error:", err);
+      res.status(500).json({ success: false, error: err.message || "Failed to evaluate matches" });
     }
   });
 
-  // POST /api/items - Report a lost or found item
+  // POST /api/matches/compare - Compare any two items on demand via Gemini
+  app.post("/api/matches/compare", async (req, res) => {
+    try {
+      const body = req.body && typeof req.body === "object" ? req.body : {};
+      const { lostItemId, foundItemId } = body;
+
+      if (!lostItemId || !foundItemId) {
+        return res.status(400).json({ success: false, error: "Both lostItemId and foundItemId are required." });
+      }
+
+      const allItems = await fetchItemsFromFirestore();
+      const lostItem = allItems.find(i => i.id === lostItemId);
+      const foundItem = allItems.find(i => i.id === foundItemId);
+
+      if (!lostItem || !foundItem) {
+        return res.status(404).json({ success: false, error: "Could not find one or both reports in Firestore." });
+      }
+
+      const result = await compareItemsWithGemini(lostItem, foundItem);
+      const matchId = `match-${lostItem.id}-${foundItem.id}`.replace(/[^a-zA-Z0-9_\-]/g, "_");
+
+      const matchRecord: ItemMatch = {
+        id: matchId,
+        lostItemId: lostItem.id,
+        foundItemId: foundItem.id,
+        lostItem,
+        foundItem,
+        matchLevel: result.matchLevel,
+        score: result.score,
+        reason: result.reason,
+        keyFactors: result.keyFactors,
+        createdAt: new Date().toISOString()
+      };
+
+      // Save to Firestore
+      await setDoc(doc(db, "matches", matchId), sanitizePayload({
+        lostItemId: matchRecord.lostItemId,
+        foundItemId: matchRecord.foundItemId,
+        matchLevel: matchRecord.matchLevel,
+        score: matchRecord.score,
+        reason: matchRecord.reason,
+        keyFactors: matchRecord.keyFactors || [],
+        createdAt: matchRecord.createdAt
+      }));
+
+      res.json({
+        success: true,
+        data: {
+          match: matchRecord,
+          analysis: result
+        }
+      });
+    } catch (err: any) {
+      console.error("Compare error:", err);
+      res.status(500).json({ success: false, error: err.message || "Comparison failed" });
+    }
+  });
+
+  // POST /api/items - Server endpoint to report an item and trigger Gemini matching
   app.post("/api/items", async (req, res) => {
     try {
       const body = req.body && typeof req.body === "object" ? req.body : {};
@@ -579,7 +605,6 @@ async function startServer() {
         contact
       } = body;
 
-      // Defensive validation
       if (!itemType || !["lost", "found"].includes(itemType)) {
         return res.status(400).json({ success: false, error: "Valid itemType ('lost' or 'found') is required." });
       }
@@ -593,11 +618,12 @@ async function startServer() {
         return res.status(400).json({ success: false, error: "Campus location is required." });
       }
       if (!contact || contact.trim().length < 3) {
-        return res.status(400).json({ success: false, error: "Valid contact information is required." });
+        return res.status(400).json({ success: false, error: "Valid contact info is required." });
       }
 
-      const newItem: CampusItem = sanitizePayload({
-        id: `item-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+      const itemId = `item-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+      const newItem: CampusItem = {
+        id: itemId,
         itemType,
         itemName: itemName.trim(),
         category: category || "Other",
@@ -610,21 +636,26 @@ async function startServer() {
         status: itemType as "lost" | "found",
         createdAt: new Date().toISOString(),
         matchedItemIds: []
-      });
+      };
 
-      itemsStore.unshift(newItem);
-      saveItems(itemsStore);
+      // Save directly to Firestore
+      await setDoc(doc(db, "items", itemId), sanitizePayload({
+        itemType: newItem.itemType,
+        itemName: newItem.itemName,
+        category: newItem.category,
+        description: newItem.description,
+        color: newItem.color,
+        location: newItem.location,
+        date: newItem.date,
+        imageUrl: newItem.imageUrl,
+        contact: newItem.contact,
+        status: newItem.status,
+        createdAt: newItem.createdAt,
+        matchedItemIds: []
+      }));
 
-      // Trigger Gemini AI Matching with an enforced safety timeout
-      let newMatches: ItemMatch[] = [];
-      try {
-        newMatches = await Promise.race([
-          evaluateItemAgainstExisting(newItem),
-          new Promise<ItemMatch[]>((resolve) => setTimeout(() => resolve([]), 3500))
-        ]);
-      } catch (matchErr) {
-        console.warn("AI matching evaluation completed with fallback:", matchErr);
-      }
+      // Evaluate against existing reports in Firestore via Gemini
+      const newMatches = await evaluateItemAgainstFirestore(newItem);
 
       res.status(201).json({
         success: true,
@@ -634,17 +665,17 @@ async function startServer() {
           matches: newMatches
         },
         message: newMatches.length > 0
-          ? `Report saved! Gemini AI found ${newMatches.length} possible matching item(s).`
-          : "Report saved successfully! We will notify you if a matching item is reported."
+          ? `Report saved to Firestore! Gemini AI found ${newMatches.length} possible matching item(s).`
+          : "Report saved to Firestore successfully! Gemini AI will monitor for matching reports."
       });
     } catch (err: any) {
       console.error("POST /api/items error:", err);
-      res.status(500).json({ success: false, error: err.message || "Failed to submit report" });
+      res.status(500).json({ success: false, error: err.message || "Failed to save item to Firestore" });
     }
   });
 
-  // POST /api/items/:id/status - Update item status (e.g. mark as 'returned')
-  app.post("/api/items/:id/status", (req, res) => {
+  // POST /api/items/:id/status - Update item status in Firestore
+  app.post("/api/items/:id/status", async (req, res) => {
     try {
       const body = req.body && typeof req.body === "object" ? req.body : {};
       const { status } = body;
@@ -653,170 +684,145 @@ async function startServer() {
         return res.status(400).json({ success: false, error: "Invalid status value." });
       }
 
-      const item = itemsStore.find(i => i.id === req.params.id);
-      if (!item) {
-        return res.status(404).json({ success: false, error: "Item not found" });
+      const itemRef = doc(db, "items", req.params.id);
+      const itemSnap = await getDoc(itemRef);
+
+      if (!itemSnap.exists()) {
+        return res.status(404).json({ success: false, error: "Item not found in Firestore." });
       }
 
-      item.status = status;
+      await updateDoc(itemRef, { status });
 
-      // If marked as returned, also update matched item if confirmed
-      if (status === "returned" && item.matchedItemIds && item.matchedItemIds.length > 0) {
-        for (const matchedId of item.matchedItemIds) {
-          const counterpart = itemsStore.find(i => i.id === matchedId);
-          if (counterpart && counterpart.status === "possible_match") {
-            counterpart.status = "returned";
+      // If marked as returned, update any matched counterparts
+      const itemData = itemSnap.data();
+      if (status === "returned" && Array.isArray(itemData.matchedItemIds)) {
+        for (const counterpartId of itemData.matchedItemIds) {
+          try {
+            await updateDoc(doc(db, "items", counterpartId), { status: "returned" });
+          } catch (e) {
+            console.warn("Could not update counterpart status:", e);
           }
         }
       }
 
-      saveItems(itemsStore);
-
       res.json({
         success: true,
-        data: item,
-        message: `Item marked as ${status}.`
+        data: { id: req.params.id, status },
+        message: `Item marked as ${status} in Firestore.`
       });
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message || "Failed to update item status" });
+      console.error("POST /api/items/:id/status error:", err);
+      res.status(500).json({ success: false, error: err.message || "Failed to update status in Firestore" });
     }
   });
 
-  // GET /api/matches - Retrieve all AI suggested matches
-  app.get("/api/matches", (req, res) => {
+  // POST /api/seed-demo - Seeds standard demo scenario into real Firestore and runs Gemini AI matching
+  app.post("/api/seed-demo", async (req, res) => {
     try {
-      // Re-hydrate matches with latest item states
-      const populated = matchesStore.map(m => {
-        const lost = itemsStore.find(i => i.id === m.lostItemId) || m.lostItem;
-        const found = itemsStore.find(i => i.id === m.foundItemId) || m.foundItem;
-        return {
-          ...m,
-          lostItem: lost,
-          foundItem: found
-        };
-      });
+      const lostId = `demo-lost-${Date.now()}`;
+      const foundId = `demo-found-${Date.now()}`;
 
-      populated.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-
-      res.json({ success: true, data: populated });
-    } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message || "Failed to fetch matches" });
-    }
-  });
-
-  // POST /api/matches/compare - Compare any two items on demand via Gemini
-  app.post("/api/matches/compare", async (req, res) => {
-    try {
-      const body = req.body && typeof req.body === "object" ? req.body : {};
-      const { lostItemId, foundItemId } = body;
-
-      const lostItem = itemsStore.find(i => i.id === lostItemId);
-      const foundItem = itemsStore.find(i => i.id === foundItemId);
-
-      if (!lostItem || !foundItem) {
-        return res.status(400).json({ success: false, error: "Both lostItem and foundItem must exist." });
-      }
-
-      const result = await compareItemsWithGemini(lostItem, foundItem);
-
-      // Save match record if not exists
-      let matchRecord = matchesStore.find(
-        m => m.lostItemId === lostItem.id && m.foundItemId === foundItem.id
-      );
-
-      if (!matchRecord) {
-        matchRecord = {
-          id: `match-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
-          lostItemId: lostItem.id,
-          foundItemId: foundItem.id,
-          lostItem,
-          foundItem,
-          matchLevel: result.matchLevel,
-          score: result.score,
-          reason: result.reason,
-          keyFactors: result.keyFactors,
-          createdAt: new Date().toISOString()
-        };
-        matchesStore.unshift(matchRecord);
-        saveMatches(matchesStore);
-      } else {
-        matchRecord.matchLevel = result.matchLevel;
-        matchRecord.score = result.score;
-        matchRecord.reason = result.reason;
-        matchRecord.keyFactors = result.keyFactors;
-        saveMatches(matchesStore);
-      }
-
-      res.json({
-        success: true,
-        data: {
-          match: matchRecord,
-          analysis: result
-        }
-      });
-    } catch (err: any) {
-      console.error("Compare error:", err);
-      res.status(500).json({ success: false, error: err.message || "Comparison failed" });
-    }
-  });
-
-  // POST /api/seed-demo - Re-seed standard demo scenario
-  app.post("/api/seed-demo", (req, res) => {
-    try {
       const demoLost: CampusItem = {
-        id: `demo-lost-${Date.now()}`,
+        id: lostId,
         itemType: "lost",
         itemName: "Black Leather Wallet",
         category: "Wallets & Cards",
-        description: "I lost a black wallet near the college canteen.",
+        description: "I lost my black leather wallet near the college canteen benches after lunch.",
         color: "Black",
         location: "College Canteen",
         date: new Date().toISOString().split("T")[0],
         contact: "student.lost@campus.edu",
-        status: "possible_match",
-        createdAt: new Date().toISOString(),
+        status: "lost",
+        createdAt: new Date(Date.now() - 3600000).toISOString(),
         matchedItemIds: []
       };
 
       const demoFound: CampusItem = {
-        id: `demo-found-${Date.now()}`,
+        id: foundId,
         itemType: "found",
         itemName: "Small Black Wallet",
         category: "Wallets & Cards",
-        description: "I found a small black wallet near the canteen.",
+        description: "Found a small black leather wallet sitting on a bench near the canteen.",
         color: "Black",
         location: "College Canteen",
         date: new Date().toISOString().split("T")[0],
-        contact: "student.finder@campus.edu",
-        status: "possible_match",
+        contact: "security.desk@campus.edu",
+        status: "found",
         createdAt: new Date().toISOString(),
-        matchedItemIds: [demoLost.id]
+        matchedItemIds: []
       };
 
-      demoLost.matchedItemIds = [demoFound.id];
+      // Save both to Firestore
+      await setDoc(doc(db, "items", lostId), sanitizePayload({
+        itemType: demoLost.itemType,
+        itemName: demoLost.itemName,
+        category: demoLost.category,
+        description: demoLost.description,
+        color: demoLost.color,
+        location: demoLost.location,
+        date: demoLost.date,
+        contact: demoLost.contact,
+        status: demoLost.status,
+        createdAt: demoLost.createdAt,
+        matchedItemIds: []
+      }));
+
+      await setDoc(doc(db, "items", foundId), sanitizePayload({
+        itemType: demoFound.itemType,
+        itemName: demoFound.itemName,
+        category: demoFound.category,
+        description: demoFound.description,
+        color: demoFound.color,
+        location: demoFound.location,
+        date: demoFound.date,
+        contact: demoFound.contact,
+        status: demoFound.status,
+        createdAt: demoFound.createdAt,
+        matchedItemIds: []
+      }));
+
+      // Run Gemini AI comparison
+      const aiResult = await compareItemsWithGemini(demoLost, demoFound);
+      const matchId = `match-${lostId}-${foundId}`;
 
       const demoMatch: ItemMatch = {
-        id: `match-${Date.now()}`,
-        lostItemId: demoLost.id,
-        foundItemId: demoFound.id,
+        id: matchId,
+        lostItemId: lostId,
+        foundItemId: foundId,
         lostItem: demoLost,
         foundItem: demoFound,
-        matchLevel: "High",
-        score: 95,
-        reason: "Both reports describe a black wallet and the same canteen location.",
-        keyFactors: [
-          "Item category: Wallet",
-          "Color match: Black",
-          "Location match: College Canteen",
-          "Close timeline"
-        ],
+        matchLevel: aiResult.matchLevel || "High",
+        score: aiResult.score || 95,
+        reason: aiResult.reason || "Both reports describe a black wallet at the College Canteen with matching timeline.",
+        keyFactors: aiResult.keyFactors || ["Matching category: Wallets", "Matching color: Black", "Location: College Canteen"],
         createdAt: new Date().toISOString()
       };
 
-      itemsStore.unshift(demoLost, demoFound);
-      matchesStore.unshift(demoMatch);
-      saveItems(itemsStore);
-      saveMatches(matchesStore);
+      // Save match to Firestore
+      await setDoc(doc(db, "matches", matchId), sanitizePayload({
+        lostItemId: demoMatch.lostItemId,
+        foundItemId: demoMatch.foundItemId,
+        matchLevel: demoMatch.matchLevel,
+        score: demoMatch.score,
+        reason: demoMatch.reason,
+        keyFactors: demoMatch.keyFactors || [],
+        createdAt: demoMatch.createdAt
+      }));
+
+      // Update statuses in Firestore
+      await updateDoc(doc(db, "items", lostId), {
+        status: "possible_match",
+        matchedItemIds: [foundId]
+      });
+      await updateDoc(doc(db, "items", foundId), {
+        status: "possible_match",
+        matchedItemIds: [lostId]
+      });
+
+      demoLost.status = "possible_match";
+      demoLost.matchedItemIds = [foundId];
+      demoFound.status = "possible_match";
+      demoFound.matchedItemIds = [lostId];
 
       res.json({
         success: true,
@@ -825,10 +831,11 @@ async function startServer() {
           foundItem: demoFound,
           match: demoMatch
         },
-        message: "Demo scenario seeded successfully!"
+        message: "Real demo scenario saved to Cloud Firestore and analyzed by Gemini AI!"
       });
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message || "Failed to seed demo" });
+      console.error("Seed demo error:", err);
+      res.status(500).json({ success: false, error: err.message || "Failed to seed demo into Firestore" });
     }
   });
 

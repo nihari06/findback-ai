@@ -32,21 +32,22 @@ service cloud.firestore {
 
     // Items collection
     match /items/{itemId} {
-      allow get, list: if isValidId(itemId);
+      allow get: if isValidId(itemId);
+      allow list: if true;
       allow create: if isValidId(itemId) && isValidItem(request.resource.data);
       // Status update action (e.g. marking as returned or possible_match)
       allow update: if isValidId(itemId) && 
-                       isValidItem(request.resource.data) &&
-                       request.resource.data.itemType == resource.data.itemType &&
-                       request.resource.data.itemName == resource.data.itemName;
+                       isValidItem(request.resource.data);
       allow delete: if false;
     }
 
     // Matches collection
     match /matches/{matchId} {
-      allow get, list: if isValidId(matchId);
+      allow get: if isValidId(matchId);
+      allow list: if true;
       allow create: if isValidId(matchId) && isValidMatch(request.resource.data);
-      allow update, delete: if false;
+      allow update: if isValidId(matchId) && isValidMatch(request.resource.data);
+      allow delete: if false;
     }
   }
 }
