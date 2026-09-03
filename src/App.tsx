@@ -34,6 +34,7 @@ import {
   subscribeToFirestoreItems,
   subscribeToFirestoreMatches
 } from './lib/firebase';
+import { getApiUrl } from './lib/api';
 
 export default function App() {
   // Navigation
@@ -59,20 +60,50 @@ export default function App() {
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [locationFilter, setLocationFilter] = useState('all');
 
-  // Fetch Items and Matches directly from Firebase Firestore
+  // Fetch Items and Matches directly from Firebase Firestore with backend fallback
   const fetchData = async () => {
     try {
       setErrorMessage(null);
-      const [firestoreItems, firestoreMatches] = await Promise.all([
-        getItemsFromFirestore(),
-        getMatchesFromFirestore()
-      ]);
+      let firestoreItems: CampusItem[] = [];
+      let firestoreMatches: ItemMatch[] = [];
+
+      try {
+        [firestoreItems, firestoreMatches] = await Promise.all([
+          getItemsFromFirestore(),
+          getMatchesFromFirestore()
+        ]);
+      } catch (clientErr) {
+        console.warn('[FindBack AI] Client Firestore query notice, trying backend API:', clientErr);
+        // Fallback to backend API
+        const [itemsRes, matchesRes] = await Promise.all([
+          fetch(getApiUrl('/api/items')).then(r => r.json()).catch(() => null),
+          fetch(getApiUrl('/api/matches')).then(r => r.json()).catch(() => null)
+        ]);
+        if (itemsRes?.success && Array.isArray(itemsRes.data)) {
+          firestoreItems = itemsRes.data;
+        }
+        if (matchesRes?.success && Array.isArray(matchesRes.data)) {
+          firestoreMatches = matchesRes.data;
+        }
+      }
+
+      // If matches from direct client is empty, check backend endpoint to ensure synchronization
+      if (firestoreMatches.length === 0) {
+        try {
+          const apiMatchesRes = await fetch(getApiUrl('/api/matches')).then(r => r.json());
+          if (apiMatchesRes?.success && Array.isArray(apiMatchesRes.data) && apiMatchesRes.data.length > 0) {
+            firestoreMatches = apiMatchesRes.data;
+          }
+        } catch {
+          // ignore
+        }
+      }
 
       setItems(firestoreItems);
       setMatches(firestoreMatches);
     } catch (err: any) {
-      console.error('Firestore connection error:', err);
-      setErrorMessage('Unable to connect to Cloud Firestore database. Please verify your connection.');
+      console.error('Data connection error:', err);
+      setErrorMessage('Unable to connect to FindBack database. Please verify your connection.');
     } finally {
       setIsLoading(false);
       setIsRefreshing(false);
@@ -156,7 +187,7 @@ export default function App() {
   const handleTriggerDemo = async () => {
     try {
       setIsRefreshing(true);
-      const response = await fetch('/api/seed-demo', { method: 'POST' });
+      const response = await fetch(getApiUrl('/api/seed-demo'), { method: 'POST' });
       const data = await response.json();
       if (data.success) {
         await fetchData();

@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { X, Sparkles, Upload, Image as ImageIcon, AlertCircle, CheckCircle2, ArrowRight, Loader2 } from 'lucide-react';
 import { ItemType, CampusItem, ItemMatch } from '../types';
 import { saveItemToFirestore } from '../lib/firebase';
+import { getApiUrl } from '../lib/api';
 
 interface ReportModalProps {
   isOpen: boolean;
@@ -155,27 +156,46 @@ export const ReportModal: React.FC<ReportModalProps> = ({
         matchedItemIds: []
       };
 
-      // 1. Direct save to Cloud Firestore
-      await saveItemToFirestore(newItem);
+      // 1. Direct save to Cloud Firestore (with backend fallback)
+      try {
+        await saveItemToFirestore(newItem);
+      } catch (fsErr) {
+        console.warn('[FindBack AI] Client direct Firestore write notice, using server endpoint fallback:', fsErr);
+        try {
+          await fetch(getApiUrl('/api/items'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(newItem)
+          });
+        } catch (serverErr) {
+          console.error('[FindBack AI] Server fallback save error:', serverErr);
+        }
+      }
 
       // 2. Evaluate with Google Gemini via secure backend route
       let matches: ItemMatch[] = [];
       try {
-        const evalRes = await fetch('/api/matches/evaluate', {
+        const evalUrl = getApiUrl('/api/matches/evaluate');
+        console.log(`[FindBack AI] Requesting AI evaluation at: ${evalUrl}`);
+        const evalRes = await fetch(evalUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ item: newItem })
         });
-        const evalData = await evalRes.json();
-        if (evalData.success && evalData.data?.matches) {
-          matches = evalData.data.matches;
-          if (matches.length > 0) {
-            newItem.status = 'possible_match';
-            newItem.matchedItemIds = matches.map(m => m.lostItemId === newItem.id ? m.foundItemId : m.lostItemId);
+        if (evalRes.ok) {
+          const evalData = await evalRes.json();
+          if (evalData.success && Array.isArray(evalData.data?.matches)) {
+            matches = evalData.data.matches;
+            if (matches.length > 0) {
+              newItem.status = 'possible_match';
+              newItem.matchedItemIds = matches.map(m => m.lostItemId === newItem.id ? m.foundItemId : m.lostItemId);
+            }
           }
+        } else {
+          console.warn(`[FindBack AI] Evaluation endpoint returned HTTP ${evalRes.status}`);
         }
       } catch (aiErr) {
-        console.warn('Gemini evaluation notice:', aiErr);
+        console.warn('[FindBack AI] Gemini evaluation notice:', aiErr);
       }
 
       // Pass back to parent dashboard

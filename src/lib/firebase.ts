@@ -11,15 +11,31 @@ import {
   Firestore
 } from 'firebase/firestore';
 import { CampusItem, ItemMatch, ItemStatus } from '../types';
-import firebaseConfig from '../../firebase-applet-config.json';
+import rawFirebaseConfig from '../../firebase-applet-config.json';
+
+// Support both static json and runtime/build-time environment variables
+const env = (import.meta as any).env || {};
+const activeFirebaseConfig = {
+  projectId: env.VITE_FIREBASE_PROJECT_ID || rawFirebaseConfig.projectId,
+  appId: env.VITE_FIREBASE_APP_ID || rawFirebaseConfig.appId,
+  apiKey: env.VITE_FIREBASE_API_KEY || rawFirebaseConfig.apiKey,
+  authDomain: env.VITE_FIREBASE_AUTH_DOMAIN || rawFirebaseConfig.authDomain,
+  firestoreDatabaseId:
+    env.VITE_FIREBASE_FIRESTORE_DATABASE_ID ||
+    env.VITE_FIRESTORE_DATABASE_ID ||
+    rawFirebaseConfig.firestoreDatabaseId ||
+    '(default)',
+  storageBucket: env.VITE_FIREBASE_STORAGE_BUCKET || rawFirebaseConfig.storageBucket,
+  messagingSenderId: env.VITE_FIREBASE_MESSAGING_SENDER_ID || rawFirebaseConfig.messagingSenderId,
+};
 
 // Initialize Firebase client
-const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
+const app = getApps().length === 0 ? initializeApp(activeFirebaseConfig) : getApp();
 
 // Use the designated databaseId from configuration
 export const db: Firestore = getFirestore(
   app,
-  firebaseConfig.firestoreDatabaseId || '(default)'
+  activeFirebaseConfig.firestoreDatabaseId || '(default)'
 );
 
 /**
@@ -199,6 +215,8 @@ export async function saveMatchToFirestore(match: ItemMatch): Promise<void> {
   const cleanMatch = sanitizeForFirestore({
     lostItemId: match.lostItemId,
     foundItemId: match.foundItemId,
+    lostItem: sanitizeForFirestore(match.lostItem as any),
+    foundItem: sanitizeForFirestore(match.foundItem as any),
     matchLevel: match.matchLevel,
     score: match.score,
     reason: match.reason,
