@@ -1,0 +1,118 @@
+{
+  "entities": {
+    "CampusItem": {
+      "title": "CampusItem",
+      "description": "Lost or found report submitted by students or staff on campus.",
+      "type": "object",
+      "properties": {
+        "itemType": {
+          "type": "string",
+          "enum": ["lost", "found"],
+          "description": "Whether the item was lost or found"
+        },
+        "itemName": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 100,
+          "description": "Name of the item"
+        },
+        "category": {
+          "type": "string",
+          "maxLength": 50,
+          "description": "Item category"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 1000,
+          "description": "Detailed description of the item"
+        },
+        "color": {
+          "type": "string",
+          "maxLength": 50,
+          "description": "Color of the item"
+        },
+        "location": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 150,
+          "description": "Campus location where lost or found"
+        },
+        "date": {
+          "type": "string",
+          "maxLength": 20,
+          "description": "Date lost or found (YYYY-MM-DD)"
+        },
+        "imageUrl": {
+          "type": "string",
+          "maxLength": 2000000,
+          "description": "Optional image URL or base64 data"
+        },
+        "contact": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 150,
+          "description": "Contact info for claiming or reporting back"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["lost", "found", "possible_match", "returned"],
+          "description": "Current lifecycle status of the item"
+        },
+        "createdAt": {
+          "type": "string",
+          "maxLength": 50,
+          "description": "ISO timestamp of creation"
+        }
+      },
+      "required": ["itemType", "itemName", "category", "description", "color", "location", "date", "contact", "status"]
+    },
+    "ItemMatch": {
+      "title": "ItemMatch",
+      "description": "AI-suggested match linking a lost item and a found item.",
+      "type": "object",
+      "properties": {
+        "lostItemId": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Document ID of the lost item"
+        },
+        "foundItemId": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Document ID of the found item"
+        },
+        "matchLevel": {
+          "type": "string",
+          "enum": ["High", "Medium", "Low", "None"],
+          "description": "Match confidence rating"
+        },
+        "score": {
+          "type": "number",
+          "description": "Numeric match score between 0 and 100"
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 1000,
+          "description": "Gemini AI explanation for the match"
+        },
+        "createdAt": {
+          "type": "string",
+          "maxLength": 50,
+          "description": "ISO timestamp of match generation"
+        }
+      },
+      "required": ["lostItemId", "foundItemId", "matchLevel", "reason"]
+    }
+  },
+  "firestore": {
+    "/items/{itemId}": {
+      "schema": "CampusItem",
+      "description": "Collection of lost and found item reports"
+    },
+    "/matches/{matchId}": {
+      "schema": "ItemMatch",
+      "description": "Collection of AI analyzed matches between items"
+    }
+  }
+}

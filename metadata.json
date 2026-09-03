@@ -1,0 +1,8 @@
+{
+  "name": "Remix FindBack AI – Smart Campus Lost \u0026 Found",
+  "description": "A smart campus lost and found web application powered by Google Gemini AI and Firebase Firestore for reporting items and finding intelligent matches.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
