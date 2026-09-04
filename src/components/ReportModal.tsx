@@ -55,10 +55,12 @@ export const ReportModal: React.FC<ReportModalProps> = ({
 
   // States
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isRetryingMatch, setIsRetryingMatch] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [submittedResult, setSubmittedResult] = useState<{
     item: CampusItem;
     matches: ItemMatch[];
+    aiUnavailable?: boolean;
   } | null>(null);
 
   // Synchronize when initialType changes
@@ -157,35 +159,51 @@ export const ReportModal: React.FC<ReportModalProps> = ({
       };
 
       // 1. Direct save to Cloud Firestore (with backend fallback)
+      console.log(`[FindBack AI] [1/4] Writing new report to Firestore: ${newItem.id} (${newItem.itemType.toUpperCase()} - "${newItem.itemName}")`);
+      let writeSucceeded = false;
       try {
         await saveItemToFirestore(newItem);
+        writeSucceeded = true;
+        console.log(`[FindBack AI] [2/4] Direct Firestore write confirmed successfully for item: ${newItem.id}`);
       } catch (fsErr) {
         console.warn('[FindBack AI] Client direct Firestore write notice, using server endpoint fallback:', fsErr);
         try {
-          await fetch(getApiUrl('/api/items'), {
+          const fbRes = await fetch(getApiUrl('/api/items'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(newItem)
           });
+          if (fbRes.ok) {
+            writeSucceeded = true;
+            console.log(`[FindBack AI] [2/4] Server fallback Firestore write confirmed for item: ${newItem.id}`);
+          }
         } catch (serverErr) {
           console.error('[FindBack AI] Server fallback save error:', serverErr);
         }
       }
 
       // 2. Evaluate with Google Gemini via secure backend route
+      console.log(`[FindBack AI] [3/4] Triggering Gemini AI matching for item: ${newItem.id}`);
       let matches: ItemMatch[] = [];
+      let aiUnavailable = false;
+
       try {
         const evalUrl = getApiUrl('/api/matches/evaluate');
         console.log(`[FindBack AI] Requesting AI evaluation at: ${evalUrl}`);
         const evalRes = await fetch(evalUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ item: newItem })
+          body: JSON.stringify({ item: newItem, itemId: newItem.id })
         });
+
         if (evalRes.ok) {
           const evalData = await evalRes.json();
-          if (evalData.success && Array.isArray(evalData.data?.matches)) {
+          if (evalData.aiUnavailable) {
+            aiUnavailable = true;
+            console.warn('[FindBack AI] Backend reported AI matching is temporarily unavailable.');
+          } else if (evalData.success && Array.isArray(evalData.data?.matches)) {
             matches = evalData.data.matches;
+            console.log(`[FindBack AI] [4/4] Evaluation received successfully: ${matches.length} match(es) discovered.`);
             if (matches.length > 0) {
               newItem.status = 'possible_match';
               newItem.matchedItemIds = matches.map(m => m.lostItemId === newItem.id ? m.foundItemId : m.lostItemId);
@@ -193,9 +211,11 @@ export const ReportModal: React.FC<ReportModalProps> = ({
           }
         } else {
           console.warn(`[FindBack AI] Evaluation endpoint returned HTTP ${evalRes.status}`);
+          aiUnavailable = true;
         }
       } catch (aiErr) {
-        console.warn('[FindBack AI] Gemini evaluation notice:', aiErr);
+        console.warn('[FindBack AI] Gemini evaluation network or parsing notice:', aiErr);
+        aiUnavailable = true;
       }
 
       // Pass back to parent dashboard
@@ -204,7 +224,8 @@ export const ReportModal: React.FC<ReportModalProps> = ({
       // Transition to clear, confirmed "Submitted" state
       setSubmittedResult({
         item: newItem,
-        matches
+        matches,
+        aiUnavailable
       });
     } catch (err: any) {
       console.error('Submit error:', err);
@@ -223,6 +244,48 @@ export const ReportModal: React.FC<ReportModalProps> = ({
     setImageUrl(null);
     setErrorMessage(null);
     setSubmittedResult(null);
+    setIsRetryingMatch(false);
+  };
+
+  const handleRetryMatching = async () => {
+    if (!submittedResult) return;
+    setIsRetryingMatch(true);
+    console.log(`[FindBack AI] User triggered manual AI match retry for item: ${submittedResult.item.id}`);
+    try {
+      const evalUrl = getApiUrl('/api/matches/evaluate');
+      const evalRes = await fetch(evalUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ item: submittedResult.item, itemId: submittedResult.item.id })
+      });
+
+      if (evalRes.ok) {
+        const evalData = await evalRes.json();
+        if (evalData.aiUnavailable) {
+          console.warn('[FindBack AI] Retry attempt reported AI matching still unavailable.');
+        } else if (evalData.success && Array.isArray(evalData.data?.matches)) {
+          const newMatches = evalData.data.matches;
+          console.log(`[FindBack AI] Retry successful: ${newMatches.length} match(es) found.`);
+          const updatedItem = { ...submittedResult.item };
+          if (newMatches.length > 0) {
+            updatedItem.status = 'possible_match';
+            updatedItem.matchedItemIds = newMatches.map((m: any) => m.lostItemId === updatedItem.id ? m.foundItemId : m.lostItemId);
+          }
+          onItemCreated(updatedItem, newMatches);
+          setSubmittedResult({
+            item: updatedItem,
+            matches: newMatches,
+            aiUnavailable: false
+          });
+        }
+      } else {
+        console.warn(`[FindBack AI] Retry endpoint returned HTTP ${evalRes.status}`);
+      }
+    } catch (retryErr) {
+      console.error('[FindBack AI] Retry matching error:', retryErr);
+    } finally {
+      setIsRetryingMatch(false);
+    }
   };
 
   return (
@@ -378,6 +441,35 @@ export const ReportModal: React.FC<ReportModalProps> = ({
                       </div>
                     );
                   })}
+                </div>
+              ) : submittedResult.aiUnavailable ? (
+                <div className="p-3.5 rounded-xl border border-amber-200 bg-amber-50/90 space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2 text-xs font-bold text-amber-900">
+                      <Sparkles className="w-4 h-4 text-amber-600" />
+                      <span>AI Matching Notice</span>
+                    </div>
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-amber-700 bg-amber-100 px-2 py-0.5 rounded">
+                      Report Saved
+                    </span>
+                  </div>
+                  <p className="text-xs text-amber-800 leading-relaxed">
+                    AI matching is temporarily unavailable. Please try again.
+                  </p>
+                  <div className="pt-1 flex items-center justify-between gap-2">
+                    <span className="text-[11px] text-amber-700">
+                      Your item has been securely saved to Firestore.
+                    </span>
+                    <button
+                      type="button"
+                      disabled={isRetryingMatch}
+                      onClick={handleRetryMatching}
+                      className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white font-bold text-xs rounded-lg shadow-xs flex items-center gap-1.5 transition-colors cursor-pointer"
+                    >
+                      <Sparkles className={`w-3.5 h-3.5 ${isRetryingMatch ? 'animate-spin' : ''}`} />
+                      <span>{isRetryingMatch ? 'Matching...' : 'Retry AI Matching'}</span>
+                    </button>
+                  </div>
                 </div>
               ) : (
                 <div className="p-3.5 rounded-xl border border-slate-200 bg-slate-50/80 space-y-1.5">

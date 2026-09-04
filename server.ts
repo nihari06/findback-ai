@@ -5,6 +5,7 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import { initializeApp, getApps, getApp } from "firebase/app";
+import rawFirebaseConfig from "./firebase-applet-config.json";
 import {
   getFirestore,
   collection,
@@ -48,30 +49,53 @@ export interface ItemMatch {
   createdAt: string;
 }
 
-// Load Firebase configuration
-let firebaseConfig: any = {
-  projectId: process.env.FIREBASE_PROJECT_ID,
-  apiKey: process.env.FIREBASE_API_KEY,
-  authDomain: process.env.FIREBASE_AUTH_DOMAIN,
-  storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
-  appId: process.env.FIREBASE_APP_ID,
-  firestoreDatabaseId: "(default)"
-};
+// Load Firebase configuration with robust fallback defaults for production deployment
+const rawConfig = (rawFirebaseConfig && typeof rawFirebaseConfig === "object") ? rawFirebaseConfig : ({} as any);
 
-try {
-  const configPath = path.join(process.cwd(), "firebase-applet-config.json");
-  if (fs.existsSync(configPath)) {
-    const fileConfig = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    firebaseConfig = { ...firebaseConfig, ...fileConfig };
-  }
-} catch (err) {
-  console.warn("Could not read firebase-applet-config.json, using environment variables:", err);
-}
+const firebaseConfig: any = {
+  projectId:
+    process.env.FIREBASE_PROJECT_ID ||
+    process.env.VITE_FIREBASE_PROJECT_ID ||
+    rawConfig.projectId ||
+    "glass-chemist-495106-k6",
+  apiKey:
+    process.env.FIREBASE_API_KEY ||
+    process.env.VITE_FIREBASE_API_KEY ||
+    rawConfig.apiKey ||
+    "AIzaSyBmqEbX3SPXYtkFRkELJkJjxOE3nsE0XzM",
+  authDomain:
+    process.env.FIREBASE_AUTH_DOMAIN ||
+    process.env.VITE_FIREBASE_AUTH_DOMAIN ||
+    rawConfig.authDomain ||
+    "glass-chemist-495106-k6.firebaseapp.com",
+  storageBucket:
+    process.env.FIREBASE_STORAGE_BUCKET ||
+    process.env.VITE_FIREBASE_STORAGE_BUCKET ||
+    rawConfig.storageBucket,
+  messagingSenderId:
+    process.env.FIREBASE_MESSAGING_SENDER_ID ||
+    process.env.VITE_FIREBASE_MESSAGING_SENDER_ID ||
+    rawConfig.messagingSenderId ||
+    "399901690863",
+  appId:
+    process.env.FIREBASE_APP_ID ||
+    process.env.VITE_FIREBASE_APP_ID ||
+    rawConfig.appId ||
+    "1:399901690863:web:288c71876d42521f44041a",
+  firestoreDatabaseId:
+    process.env.FIRESTORE_DATABASE_ID ||
+    process.env.FIREBASE_DATABASE_ID ||
+    process.env.FIREBASE_FIRESTORE_DATABASE_ID ||
+    process.env.VITE_FIREBASE_FIRESTORE_DATABASE_ID ||
+    rawConfig.firestoreDatabaseId ||
+    "ai-studio-remixfindbackais-9a55e96f-c9c6-4ca2-9b5d-95a56c55acfd"
+};
 
 // Initialize Firebase SDK
 const fbApp = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
-const db: Firestore = getFirestore(fbApp, firebaseConfig.firestoreDatabaseId || "(default)");
+const db: Firestore = getFirestore(fbApp, firebaseConfig.firestoreDatabaseId);
+
+console.log(`[FindBack AI Server] Initialized Firebase Firestore connection: Project "${firebaseConfig.projectId}", Database "${firebaseConfig.firestoreDatabaseId}"`);
 
 // Strict undefined stripper to ensure zero Firestore crashes
 function sanitizePayload<T extends Record<string, any>>(obj: T): T {
@@ -93,8 +117,13 @@ const FALLBACK_MODELS = [
 ];
 
 function getGeminiClient(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey =
+    process.env.GEMINI_API_KEY ||
+    process.env.GOOGLE_API_KEY ||
+    process.env.GENAI_API_KEY;
+
   if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
+    console.warn("[FindBack AI Server] Gemini API key not found in process.env (checked GEMINI_API_KEY, GOOGLE_API_KEY, GENAI_API_KEY)");
     return null;
   }
   return new GoogleGenAI({
@@ -298,29 +327,34 @@ async function compareItemsWithGemini(
   score: number;
   reason: string;
   keyFactors: string[];
+  aiError?: boolean;
 }> {
   // First evaluate deterministic rules
   const heuristic = calculateHeuristicMatch(lostItem, foundItem);
 
   // If the items are completely incompatible objects, do NOT consider them a match
   if (!heuristic.isCompatibleObject) {
+    console.log(`[FindBack AI] Candidate comparison [${lostItem.itemName} vs ${foundItem.itemName}]: Incompatible object types.`);
     return {
       isMatch: false,
       matchLevel: "None",
       score: Math.min(15, heuristic.score),
       reason: "No strong match found. The reports describe completely different types of items.",
-      keyFactors: ["Different item categories and physical object types"]
+      keyFactors: ["Different item categories and physical object types"],
+      aiError: false
     };
   }
 
   const ai = getGeminiClient();
   if (!ai) {
+    console.warn(`[FindBack AI] Gemini Client is unavailable (missing API key).`);
     return {
       isMatch: heuristic.isMatch,
       matchLevel: heuristic.matchLevel,
       score: heuristic.score,
       reason: heuristic.score >= 50 ? heuristic.reason : "No strong match found.",
-      keyFactors: heuristic.keyFactors
+      keyFactors: heuristic.keyFactors,
+      aiError: true
     };
   }
 
@@ -359,8 +393,11 @@ Respond ONLY with this JSON schema:
   "keyFactors": string[] (2 to 4 bullet points of matching details or why they differ)
 }`;
 
+  console.log(`[FindBack AI] [Gemini Request] Comparing Lost "${lostItem.itemName}" (#${lostItem.id}) with Found "${foundItem.itemName}" (#${foundItem.id})`);
+
   for (const model of FALLBACK_MODELS) {
     try {
+      console.log(`[FindBack AI] Invoking Gemini model: ${model}`);
       const responsePromise = ai.models.generateContent({
         model,
         contents: prompt,
@@ -370,8 +407,9 @@ Respond ONLY with this JSON schema:
         },
       });
 
+      // 12-second timeout to prevent premature aborts on cold starts or network latency
       const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`Timeout for model ${model}`)), 4000)
+        setTimeout(() => reject(new Error(`Timeout for model ${model}`)), 12000)
       );
 
       const response = (await Promise.race([responsePromise, timeoutPromise])) as any;
@@ -382,27 +420,31 @@ Respond ONLY with this JSON schema:
         const matchLevel = parsed.matchLevel || (score >= 75 ? "High" : score >= 50 ? "Medium" : "None");
         const isMatch = (matchLevel === "High" || matchLevel === "Medium") && score >= 50;
 
+        console.log(`[FindBack AI] [Gemini Response] Successfully evaluated with ${model}. isMatch: ${isMatch}, matchLevel: ${matchLevel}, score: ${score}`);
+
         return {
           isMatch,
           matchLevel: isMatch ? matchLevel : "None",
           score,
           reason: isMatch ? (parsed.reason || heuristic.reason) : "No strong match found.",
           keyFactors: Array.isArray(parsed.keyFactors) && parsed.keyFactors.length > 0 ? parsed.keyFactors : heuristic.keyFactors,
+          aiError: false
         };
       }
     } catch (err: any) {
-      console.warn(`Gemini model ${model} skipped or timed out:`, err?.message || err);
+      console.warn(`[FindBack AI] Gemini model ${model} skipped or timed out:`, err?.message || err);
       continue;
     }
   }
 
-  // Graceful fallback
+  console.warn("[FindBack AI] All Gemini models in fallback ladder failed or timed out.");
   return {
     isMatch: heuristic.isMatch,
     matchLevel: heuristic.matchLevel,
     score: heuristic.score,
     reason: heuristic.score >= 50 ? heuristic.reason : "No strong match found.",
-    keyFactors: heuristic.keyFactors
+    keyFactors: heuristic.keyFactors,
+    aiError: true
   };
 }
 
@@ -476,8 +518,15 @@ async function fetchMatchesFromFirestore(): Promise<ItemMatch[]> {
 }
 
 // Evaluate a new item against existing items in Firestore using Gemini
-async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<ItemMatch[]> {
+async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<{
+  matches: ItemMatch[];
+  aiUnavailable?: boolean;
+}> {
+  console.log(`[FindBack AI] [Matching Trigger] Starting evaluation for item: ${newItem.id} (${newItem.itemType.toUpperCase()} - "${newItem.itemName}")`);
+
   const allItems = await fetchItemsFromFirestore();
+  console.log(`[FindBack AI] [Firestore Query] Retrieved ${allItems.length} total items from database.`);
+
   // 1. When a LOST item is submitted, compare it ONLY with existing FOUND items.
   // 2. When a FOUND item is submitted, compare it ONLY with existing LOST items.
   const oppositeType = newItem.itemType === "lost" ? "found" : "lost";
@@ -485,8 +534,11 @@ async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<ItemMa
     item => item.id !== newItem.id && item.itemType === oppositeType && item.status !== "returned"
   );
 
+  console.log(`[FindBack AI] [Candidate Filter] Found ${potentialMatches.length} candidate opposite-type (${oppositeType}) items.`);
+
   if (potentialMatches.length === 0) {
-    return [];
+    console.log(`[FindBack AI] No candidate ${oppositeType} reports currently exist in Firestore. Evaluation complete (0 matches).`);
+    return { matches: [], aiUnavailable: false };
   }
 
   // Pre-filter candidates by compatibility and heuristic score
@@ -504,14 +556,19 @@ async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<ItemMa
     .slice(0, 5); // Evaluate top 5 compatible candidates
 
   if (promisingCandidates.length === 0) {
-    return [];
+    console.log(`[FindBack AI] None of the ${potentialMatches.length} candidates were compatible with "${newItem.itemName}". Evaluation complete (0 matches).`);
+    return { matches: [], aiUnavailable: false };
   }
 
   const discoveredMatches: ItemMatch[] = [];
+  let anyModelSucceeded = false;
 
   for (const { lost, found } of promisingCandidates) {
     try {
       const result = await compareItemsWithGemini(lost, found);
+      if (!result.aiError) {
+        anyModelSucceeded = true;
+      }
 
       // Only show a match when the overall relevance passes a reasonable confidence threshold
       if (result.isMatch && (result.matchLevel === "High" || result.matchLevel === "Medium") && result.score >= 50) {
@@ -530,6 +587,7 @@ async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<ItemMa
         };
 
         // Save match to Firestore
+        console.log(`[FindBack AI] [Match Creation] Match confirmed! Saving match ${matchId} to Firestore.`);
         await setDoc(doc(db, "matches", matchId), sanitizePayload({
           lostItemId: matchRecord.lostItemId,
           foundItemId: matchRecord.foundItemId,
@@ -560,18 +618,22 @@ async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<ItemMa
             setIds.add(lost.id);
             await updateDoc(foundRef, { status: "possible_match", matchedItemIds: Array.from(setIds) });
           }
+          console.log(`[FindBack AI] [Firestore Status Update] Updated statuses for items ${lost.id} and ${found.id} to possible_match.`);
         } catch (statusErr) {
-          console.warn("Could not update item match statuses in Firestore:", statusErr);
+          console.warn("[FindBack AI] Could not update item match statuses in Firestore:", statusErr);
         }
 
         discoveredMatches.push(matchRecord);
       }
     } catch (evalErr) {
-      console.error("Match evaluation error:", evalErr);
+      console.error("[FindBack AI] Match evaluation loop error:", evalErr);
     }
   }
 
-  return discoveredMatches;
+  const aiUnavailable = promisingCandidates.length > 0 && !anyModelSucceeded;
+  console.log(`[FindBack AI] [Evaluation Result] Finished evaluation. Discovered matches: ${discoveredMatches.length}. AI Unavailable: ${aiUnavailable}`);
+
+  return { matches: discoveredMatches, aiUnavailable };
 }
 
 async function startServer() {
@@ -618,22 +680,41 @@ async function startServer() {
   app.post("/api/matches/evaluate", async (req, res) => {
     try {
       const body = req.body && typeof req.body === "object" ? req.body : {};
-      const { item } = body;
+      const { item, itemId } = body;
 
-      if (!item || !item.id || !item.itemType) {
+      const targetItem = item || (itemId ? (await fetchItemsFromFirestore()).find(i => i.id === itemId) : null);
+
+      if (!targetItem || !targetItem.id || !targetItem.itemType) {
         return res.status(400).json({ success: false, error: "Valid item report is required." });
       }
 
-      const matches = await evaluateItemAgainstFirestore(item);
+      console.log(`[FindBack AI] [API Endpoint] Received POST /api/matches/evaluate for item: ${targetItem.id} (${targetItem.itemName})`);
+
+      const evalResult = await evaluateItemAgainstFirestore(targetItem);
+
+      if (evalResult.aiUnavailable) {
+        return res.json({
+          success: true,
+          aiUnavailable: true,
+          data: {
+            item: targetItem,
+            matchesFound: 0,
+            matches: []
+          },
+          message: "AI matching is temporarily unavailable. Please try again."
+        });
+      }
+
       res.json({
         success: true,
+        aiUnavailable: false,
         data: {
-          item,
-          matchesFound: matches.length,
-          matches
+          item: targetItem,
+          matchesFound: evalResult.matches.length,
+          matches: evalResult.matches
         },
-        message: matches.length > 0
-          ? `Gemini AI discovered ${matches.length} possible matching report(s).`
+        message: evalResult.matches.length > 0
+          ? `Gemini AI discovered ${evalResult.matches.length} possible matching report(s).`
           : "Report analyzed by Gemini AI. No immediate matching reports found."
       });
     } catch (err: any) {
@@ -768,7 +849,8 @@ async function startServer() {
       }));
 
       // Evaluate against existing reports in Firestore via Gemini
-      const newMatches = await evaluateItemAgainstFirestore(newItem);
+      const evalResult = await evaluateItemAgainstFirestore(newItem);
+      const newMatches = evalResult.matches;
 
       res.status(201).json({
         success: true,
@@ -953,7 +1035,11 @@ async function startServer() {
   });
 
   // Vite middleware in dev mode / static serving in production
-  if (process.env.NODE_ENV !== "production") {
+  const isProduction =
+    process.env.NODE_ENV === "production" ||
+    (typeof process.argv[1] === "string" && process.argv[1].endsWith(".cjs"));
+
+  if (!isProduction) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
