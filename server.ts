@@ -517,12 +517,12 @@ async function fetchMatchesFromFirestore(): Promise<ItemMatch[]> {
   }
 }
 
-// Evaluate a new item against existing items in Firestore using Gemini
+// Evaluate a new item against existing items in Firestore using Gemini in ONE immediate evaluation
 async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<{
   matches: ItemMatch[];
   aiUnavailable?: boolean;
 }> {
-  console.log(`[FindBack AI] [Matching Trigger] Starting evaluation for item: ${newItem.id} (${newItem.itemType.toUpperCase()} - "${newItem.itemName}")`);
+  console.log(`[FindBack AI] [Matching Trigger] Starting ONE immediate AI matching evaluation for item: ${newItem.id} (${newItem.itemType.toUpperCase()} - "${newItem.itemName}")`);
 
   const allItems = await fetchItemsFromFirestore();
   console.log(`[FindBack AI] [Firestore Query] Retrieved ${allItems.length} total items from database.`);
@@ -537,103 +537,175 @@ async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<{
   console.log(`[FindBack AI] [Candidate Filter] Found ${potentialMatches.length} candidate opposite-type (${oppositeType}) items.`);
 
   if (potentialMatches.length === 0) {
-    console.log(`[FindBack AI] No candidate ${oppositeType} reports currently exist in Firestore. Evaluation complete (0 matches).`);
+    console.log(`[FindBack AI] No candidate ${oppositeType} reports currently exist in Firestore at submission time. Evaluation complete (0 matches).`);
     return { matches: [], aiUnavailable: false };
   }
 
-  // Pre-filter candidates by compatibility and heuristic score
-  const candidatesWithHeuristic = potentialMatches.map(candidate => {
-    const lost = newItem.itemType === "lost" ? newItem : candidate;
-    const found = newItem.itemType === "found" ? newItem : candidate;
-    const heuristic = calculateHeuristicMatch(lost, found);
-    return { candidate, lost, found, heuristic };
-  });
-
-  // Keep all potentially compatible candidates
-  const promisingCandidates = candidatesWithHeuristic
-    .filter(c => c.heuristic.isCompatibleObject || c.heuristic.score >= 25)
-    .sort((a, b) => b.heuristic.score - a.heuristic.score)
-    .slice(0, 5); // Evaluate top 5 compatible candidates
-
-  if (promisingCandidates.length === 0) {
-    console.log(`[FindBack AI] None of the ${potentialMatches.length} candidates were compatible with "${newItem.itemName}". Evaluation complete (0 matches).`);
-    return { matches: [], aiUnavailable: false };
+  const ai = getGeminiClient();
+  if (!ai) {
+    console.warn(`[FindBack AI] Gemini Client is unavailable (missing API key).`);
+    return { matches: [], aiUnavailable: true };
   }
 
-  const discoveredMatches: ItemMatch[] = [];
-  let anyModelSucceeded = false;
+  // Format existing opposite-type reports for Gemini evaluation
+  const candidateSlice = potentialMatches.slice(0, 15);
+  const candidatesText = candidateSlice.map((c, index) => {
+    return `CANDIDATE REPORT #${index + 1}:
+- Document ID: "${c.id}"
+- Item Name: "${c.itemName}"
+- Category: "${c.category}"
+- Description: "${c.description}"
+- Color: "${c.color}"
+- Location: "${c.location}"
+- Date Reported: "${c.date}"`;
+  }).join("\n\n");
 
-  for (const { lost, found } of promisingCandidates) {
+  const prompt = `You are the AI matching engine for 'FindBack AI', a campus lost and found platform.
+A student has just submitted a ${newItem.itemType.toUpperCase()} report.
+Perform ONE immediate AI evaluation comparing this newly submitted report against the ${candidateSlice.length} EXISTING ${oppositeType.toUpperCase()} reports retrieved from the campus database.
+
+SUBMITTED ${newItem.itemType.toUpperCase()} REPORT:
+- Document ID: "${newItem.id}"
+- Item Name: "${newItem.itemName}"
+- Category: "${newItem.category}"
+- Description: "${newItem.description}"
+- Color: "${newItem.color}"
+- Location: "${newItem.location}"
+- Date Reported: "${newItem.date}"
+
+EXISTING ${oppositeType.toUpperCase()} REPORTS IN CAMPUS DATABASE:
+${candidatesText}
+
+MATCHING INSTRUCTIONS:
+1. Dynamic Item Matching: Compare item type/name, category, description, unique details, brand/model if available, color, location, and date.
+2. Semantic Understanding: Recognize that students describe the SAME object with different terms (e.g., "MacBook" == "Apple laptop", "specs" == "reading glasses", "school bag" == "backpack", "earbuds" == "AirPods", "water flask" == "water bottle", "keys" == "keychain", "college ID" == "student ID card").
+3. Strict Genuine Match: Do NOT match unrelated items merely because they have the same location or color. Two different physical objects (such as an ID card vs a charger, or an umbrella vs a jacket) must NEVER match. Do NOT force a match.
+4. If NO genuine match exists among the candidate reports:
+   Set "hasMatch": false, "matchedReportId": null, "confidence": "Low", "score": 10, "reason": "No strong match found.", "keyFactors": []
+5. If a genuine match DOES exist:
+   Set "hasMatch": true, "matchedReportId": "<Document ID of the matched candidate>", "confidence": "High" | "Medium" | "Low", "score": <number between 50 and 100>, "reason": "<clear, concise explanation of why this is a match based on item attributes>", "keyFactors": ["<key factor 1>", "<key factor 2>"]
+
+Respond ONLY with valid JSON in this schema:
+{
+  "hasMatch": boolean,
+  "matchedReportId": string | null,
+  "confidence": "High" | "Medium" | "Low",
+  "score": number,
+  "reason": string,
+  "keyFactors": string[]
+}`;
+
+  console.log(`[FindBack AI] [Gemini Request] Sending submitted ${newItem.itemType.toUpperCase()} "${newItem.itemName}" and ${candidateSlice.length} candidate reports to Gemini...`);
+
+  let evalSuccess = false;
+  let parsedResult: any = null;
+
+  for (const model of FALLBACK_MODELS) {
     try {
-      const result = await compareItemsWithGemini(lost, found);
-      if (!result.aiError) {
-        anyModelSucceeded = true;
+      console.log(`[FindBack AI] Invoking Gemini model: ${model}`);
+      const responsePromise = ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          temperature: 0.1,
+        },
+      });
+
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`Timeout for model ${model}`)), 12000)
+      );
+
+      const response = (await Promise.race([responsePromise, timeoutPromise])) as any;
+
+      if (response && response.text) {
+        parsedResult = JSON.parse(response.text.trim());
+        evalSuccess = true;
+        console.log(`[FindBack AI] [Gemini Response] Successfully evaluated with ${model}: hasMatch = ${parsedResult.hasMatch}, matchedReportId = ${parsedResult.matchedReportId}, confidence = ${parsedResult.confidence}`);
+        break;
       }
-
-      // Only show a match when the overall relevance passes a reasonable confidence threshold
-      if (result.isMatch && (result.matchLevel === "High" || result.matchLevel === "Medium") && result.score >= 50) {
-        const matchId = `match-${lost.id}-${found.id}`.replace(/[^a-zA-Z0-9_\-]/g, "_");
-        const matchRecord: ItemMatch = {
-          id: matchId,
-          lostItemId: lost.id,
-          foundItemId: found.id,
-          lostItem: lost,
-          foundItem: found,
-          matchLevel: result.matchLevel,
-          score: result.score,
-          reason: result.reason,
-          keyFactors: result.keyFactors,
-          createdAt: new Date().toISOString(),
-        };
-
-        // Save match to Firestore
-        console.log(`[FindBack AI] [Match Creation] Match confirmed! Saving match ${matchId} to Firestore.`);
-        await setDoc(doc(db, "matches", matchId), sanitizePayload({
-          lostItemId: matchRecord.lostItemId,
-          foundItemId: matchRecord.foundItemId,
-          matchLevel: matchRecord.matchLevel,
-          score: matchRecord.score,
-          reason: matchRecord.reason,
-          keyFactors: matchRecord.keyFactors || [],
-          createdAt: matchRecord.createdAt
-        }));
-
-        // Update item statuses to possible_match in Firestore
-        try {
-          const lostRef = doc(db, "items", lost.id);
-          const foundRef = doc(db, "items", found.id);
-
-          const lostSnap = await getDoc(lostRef);
-          if (lostSnap.exists()) {
-            const curLost = lostSnap.data();
-            const setIds = new Set<string>(Array.isArray(curLost.matchedItemIds) ? curLost.matchedItemIds : []);
-            setIds.add(found.id);
-            await updateDoc(lostRef, { status: "possible_match", matchedItemIds: Array.from(setIds) });
-          }
-
-          const foundSnap = await getDoc(foundRef);
-          if (foundSnap.exists()) {
-            const curFound = foundSnap.data();
-            const setIds = new Set<string>(Array.isArray(curFound.matchedItemIds) ? curFound.matchedItemIds : []);
-            setIds.add(lost.id);
-            await updateDoc(foundRef, { status: "possible_match", matchedItemIds: Array.from(setIds) });
-          }
-          console.log(`[FindBack AI] [Firestore Status Update] Updated statuses for items ${lost.id} and ${found.id} to possible_match.`);
-        } catch (statusErr) {
-          console.warn("[FindBack AI] Could not update item match statuses in Firestore:", statusErr);
-        }
-
-        discoveredMatches.push(matchRecord);
-      }
-    } catch (evalErr) {
-      console.error("[FindBack AI] Match evaluation loop error:", evalErr);
+    } catch (err: any) {
+      console.warn(`[FindBack AI] Gemini model ${model} skipped or timed out:`, err?.message || err);
+      continue;
     }
   }
 
-  const aiUnavailable = promisingCandidates.length > 0 && !anyModelSucceeded;
-  console.log(`[FindBack AI] [Evaluation Result] Finished evaluation. Discovered matches: ${discoveredMatches.length}. AI Unavailable: ${aiUnavailable}`);
+  if (!evalSuccess || !parsedResult) {
+    console.warn("[FindBack AI] All Gemini models in fallback ladder failed or timed out.");
+    return { matches: [], aiUnavailable: true };
+  }
 
-  return { matches: discoveredMatches, aiUnavailable };
+  if (!parsedResult.hasMatch || !parsedResult.matchedReportId) {
+    console.log("[FindBack AI] Gemini evaluated existing reports: No genuine match found.");
+    return { matches: [], aiUnavailable: false };
+  }
+
+  // Find the matched item from the candidate list (from Firestore)
+  const matchedItem = potentialMatches.find(item => item.id === parsedResult.matchedReportId);
+  if (!matchedItem) {
+    console.warn(`[FindBack AI] Gemini suggested match ID ${parsedResult.matchedReportId}, but it was not found in candidates list.`);
+    return { matches: [], aiUnavailable: false };
+  }
+
+  const lostItem = newItem.itemType === "lost" ? newItem : matchedItem;
+  const foundItem = newItem.itemType === "found" ? newItem : matchedItem;
+
+  const matchId = `match-${lostItem.id}-${foundItem.id}`.replace(/[^a-zA-Z0-9_\-]/g, "_");
+  const matchRecord: ItemMatch = {
+    id: matchId,
+    lostItemId: lostItem.id,
+    foundItemId: foundItem.id,
+    lostItem,
+    foundItem,
+    matchLevel: parsedResult.confidence || (parsedResult.score >= 75 ? "High" : parsedResult.score >= 50 ? "Medium" : "Low"),
+    score: typeof parsedResult.score === "number" ? parsedResult.score : 85,
+    reason: parsedResult.reason || "AI matched attributes between reports.",
+    keyFactors: Array.isArray(parsedResult.keyFactors) ? parsedResult.keyFactors : [],
+    createdAt: new Date().toISOString(),
+  };
+
+  // Save match to Firestore
+  console.log(`[FindBack AI] [Match Creation] Genuine match discovered! Saving match ${matchId} to Firestore.`);
+  try {
+    await setDoc(doc(db, "matches", matchId), sanitizePayload({
+      lostItemId: matchRecord.lostItemId,
+      foundItemId: matchRecord.foundItemId,
+      matchLevel: matchRecord.matchLevel,
+      score: matchRecord.score,
+      reason: matchRecord.reason,
+      keyFactors: matchRecord.keyFactors || [],
+      createdAt: matchRecord.createdAt
+    }));
+  } catch (mErr) {
+    console.error("[FindBack AI] Failed to save match to Firestore:", mErr);
+  }
+
+  // Update item statuses to possible_match in Firestore
+  try {
+    const lostRef = doc(db, "items", lostItem.id);
+    const foundRef = doc(db, "items", foundItem.id);
+
+    const lostSnap = await getDoc(lostRef);
+    if (lostSnap.exists()) {
+      const curLost = lostSnap.data();
+      const setIds = new Set<string>(Array.isArray(curLost.matchedItemIds) ? curLost.matchedItemIds : []);
+      setIds.add(foundItem.id);
+      await updateDoc(lostRef, { status: "possible_match", matchedItemIds: Array.from(setIds) });
+    }
+
+    const foundSnap = await getDoc(foundRef);
+    if (foundSnap.exists()) {
+      const curFound = foundSnap.data();
+      const setIds = new Set<string>(Array.isArray(curFound.matchedItemIds) ? curFound.matchedItemIds : []);
+      setIds.add(lostItem.id);
+      await updateDoc(foundRef, { status: "possible_match", matchedItemIds: Array.from(setIds) });
+    }
+    console.log(`[FindBack AI] [Firestore Status Update] Updated statuses for items ${lostItem.id} and ${foundItem.id} to possible_match.`);
+  } catch (statusErr) {
+    console.warn("[FindBack AI] Could not update item match statuses in Firestore:", statusErr);
+  }
+
+  return { matches: [matchRecord], aiUnavailable: false };
 }
 
 async function startServer() {
