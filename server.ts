@@ -537,8 +537,8 @@ async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<{
   console.log(`[FindBack AI] [Candidate Filter] Found ${potentialMatches.length} candidate opposite-type (${oppositeType}) items.`);
 
   if (potentialMatches.length === 0) {
-    console.log("[FindBack AI] No candidate items found to match against.");
-    return { matches: [], aiUnavailable: false };
+    console.log(`[FindBack AI] No potential candidate items found for matching.`);
+    return { matches: [] };
   }
 
   const matches: ItemMatch[] = [];
@@ -548,24 +548,23 @@ async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<{
     const lostItem = newItem.itemType === "lost" ? newItem : candidate;
     const foundItem = newItem.itemType === "found" ? newItem : candidate;
 
-    const matchResult = await compareItemsWithGemini(lostItem, foundItem);
-
-    if (matchResult.aiError) {
+    const res = await compareItemsWithGemini(lostItem, foundItem);
+    if (res.aiError) {
       aiUnavailable = true;
     }
 
-    if (matchResult.isMatch) {
-      const matchId = `${lostItem.id}_${foundItem.id}`;
-      const newMatch: ItemMatch = {
+    if (res.isMatch) {
+      const matchId = `match_${lostItem.id}_${foundItem.id}`;
+      const matchObj: ItemMatch = {
         id: matchId,
         lostItemId: lostItem.id,
         foundItemId: foundItem.id,
         lostItem,
         foundItem,
-        matchLevel: matchResult.matchLevel,
-        score: matchResult.score,
-        reason: matchResult.reason,
-        keyFactors: matchResult.keyFactors,
+        matchLevel: res.matchLevel,
+        score: res.score,
+        reason: res.reason,
+        keyFactors: res.keyFactors,
         createdAt: new Date().toISOString()
       };
 
@@ -573,29 +572,27 @@ async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<{
         await setDoc(doc(db, "matches", matchId), sanitizePayload({
           lostItemId: lostItem.id,
           foundItemId: foundItem.id,
-          matchLevel: matchResult.matchLevel,
-          score: matchResult.score,
-          reason: matchResult.reason,
-          keyFactors: matchResult.keyFactors,
-          createdAt: newMatch.createdAt
+          matchLevel: res.matchLevel,
+          score: res.score,
+          reason: res.reason,
+          keyFactors: res.keyFactors,
+          createdAt: matchObj.createdAt
         }));
 
-        const updatedLostMatched = Array.from(new Set([...(lostItem.matchedItemIds || []), foundItem.id]));
-        const updatedFoundMatched = Array.from(new Set([...(foundItem.matchedItemIds || []), lostItem.id]));
+        const updateItemStatus = async (item: CampusItem, matchedWithId: string) => {
+          const matchedItemIds = Array.from(new Set([...(item.matchedItemIds || []), matchedWithId]));
+          await updateDoc(doc(db, "items", item.id), sanitizePayload({
+            status: item.status === "returned" ? "returned" : "possible_match",
+            matchedItemIds
+          }));
+        };
 
-        await updateDoc(doc(db, "items", lostItem.id), sanitizePayload({
-          status: "possible_match",
-          matchedItemIds: updatedLostMatched
-        }));
+        await updateItemStatus(lostItem, foundItem.id);
+        await updateItemStatus(foundItem, lostItem.id);
 
-        await updateDoc(doc(db, "items", foundItem.id), sanitizePayload({
-          status: "possible_match",
-          matchedItemIds: updatedFoundMatched
-        }));
-
-        matches.push(newMatch);
+        matches.push(matchObj);
       } catch (err) {
-        console.error("Error saving match to Firestore:", err);
+        console.error("Error saving match:", err);
       }
     }
   }
@@ -603,34 +600,40 @@ async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<{
   return { matches, aiUnavailable };
 }
 
-// Create Express Server
-async function startServer() {
+async function createServer() {
   const app = express();
-  const PORT = process.env.PORT || 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json({ limit: "10mb" }));
 
-  // GET /api/items - Retrieve all items
+  // API Routes
   app.get("/api/items", async (_req, res) => {
     try {
       const items = await fetchItemsFromFirestore();
       res.json(items);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || "Failed to fetch items" });
+    } catch (err) {
+      res.status(500).json({ error: "Failed to fetch items" });
     }
   });
 
-  // POST /api/items - Create a new lost/found item and evaluate matches
   app.post("/api/items", async (req, res) => {
     try {
-      const itemData = req.body;
-      const itemId = itemData.id || `item_${Date.now()}`;
+      const body = req.body;
+      const itemId = body.id || `item_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
       const newItem: CampusItem = {
-        ...itemData,
         id: itemId,
-        status: itemData.status || itemData.itemType || "lost",
-        createdAt: itemData.createdAt || new Date().toISOString(),
-        matchedItemIds: itemData.matchedItemIds || []
+        itemType: body.itemType,
+        itemName: body.itemName,
+        category: body.category || "Other",
+        description: body.description || "",
+        color: body.color || "Not specified",
+        location: body.location || "",
+        date: body.date || new Date().toISOString().split("T")[0],
+        imageUrl: body.imageUrl || undefined,
+        contact: body.contact || "",
+        status: body.status || body.itemType,
+        createdAt: new Date().toISOString(),
+        matchedItemIds: []
       };
 
       await setDoc(doc(db, "items", itemId), sanitizePayload(newItem));
@@ -647,40 +650,31 @@ async function startServer() {
     }
   });
 
-  // GET /api/matches - Retrieve all active matches
   app.get("/api/matches", async (_req, res) => {
     try {
       const matches = await fetchMatchesFromFirestore();
       res.json(matches);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || "Failed to fetch matches" });
+    } catch (err) {
+      res.status(500).json({ error: "Failed to fetch matches" });
     }
   });
 
-  // POST /api/evaluate - Re-evaluate matches for an item
-  app.post("/api/evaluate", async (req, res) => {
+  app.patch("/api/items/:id/status", async (req, res) => {
     try {
-      const { itemId } = req.body;
-      if (!itemId) {
-        return res.status(400).json({ error: "itemId parameter is required" });
-      }
-      const itemDoc = await getDoc(doc(db, "items", itemId));
-      if (!itemDoc.exists()) {
-        return res.status(404).json({ error: "Item not found" });
-      }
-      const item = { id: itemDoc.id, ...itemDoc.data() } as CampusItem;
-      const evalResult = await evaluateItemAgainstFirestore(item);
-      res.json(evalResult);
+      const { id } = req.params;
+      const { status } = req.body;
+      await updateDoc(doc(db, "items", id), sanitizePayload({ status }));
+      res.json({ success: true, id, status });
     } catch (err: any) {
-      res.status(500).json({ error: err.message || "Failed to evaluate item" });
+      res.status(500).json({ error: err.message || "Failed to update item status" });
     }
   });
 
-  // Vite Integration / Static Asset Serving
+  // Vite development or static file serving
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
-      appType: "custom"
+      appType: "custom",
     });
     app.use(vite.middlewares);
     app.use("*", async (req, res, next) => {
@@ -695,15 +689,16 @@ async function startServer() {
       }
     });
   } else {
-    app.use(express.static(path.resolve(".", "dist")));
-    app.get("*", (_req, res) => {
-      res.sendFile(path.resolve(".", "dist", "index.html"));
+    const distPath = path.resolve(".", "dist");
+    app.use(express.static(distPath));
+    app.use("*", (_req, res) => {
+      res.sendFile(path.resolve(distPath, "index.html"));
     });
   }
 
-  app.listen(PORT, () => {
+  app.listen(PORT, "0.0.0.0", () => {
     console.log(`[FindBack AI Server] Running on http://localhost:${PORT}`);
   });
 }
 
-startServer();
+createServer();
