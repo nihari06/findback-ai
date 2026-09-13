@@ -537,72 +537,75 @@ async function evaluateItemAgainstFirestore(newItem: CampusItem): Promise<{
   console.log(`[FindBack AI] [Candidate Filter] Found ${potentialMatches.length} candidate opposite-type (${oppositeType}) items.`);
 
   if (potentialMatches.length === 0) {
-    console.log(`[FindBack AI] No potential candidate items found for matching.`);
-    return { matches: [] };
+    console.log("[FindBack AI] No potential candidate items found for matching.");
+    return { matches: [], aiUnavailable: false };
   }
 
-  const matches: ItemMatch[] = [];
+  const createdMatches: ItemMatch[] = [];
   let aiUnavailable = false;
 
   for (const candidate of potentialMatches) {
     const lostItem = newItem.itemType === "lost" ? newItem : candidate;
     const foundItem = newItem.itemType === "found" ? newItem : candidate;
 
-    const res = await compareItemsWithGemini(lostItem, foundItem);
-    if (res.aiError) {
+    const result = await compareItemsWithGemini(lostItem, foundItem);
+    if (result.aiError) {
       aiUnavailable = true;
     }
 
-    if (res.isMatch) {
+    if (result.isMatch) {
       const matchId = `match_${lostItem.id}_${foundItem.id}`;
-      const matchObj: ItemMatch = {
+      const matchData: ItemMatch = {
         id: matchId,
         lostItemId: lostItem.id,
         foundItemId: foundItem.id,
         lostItem,
         foundItem,
-        matchLevel: res.matchLevel,
-        score: res.score,
-        reason: res.reason,
-        keyFactors: res.keyFactors,
+        matchLevel: result.matchLevel,
+        score: result.score,
+        reason: result.reason,
+        keyFactors: result.keyFactors,
         createdAt: new Date().toISOString()
       };
 
       try {
         await setDoc(doc(db, "matches", matchId), sanitizePayload({
-          lostItemId: lostItem.id,
-          foundItemId: foundItem.id,
-          matchLevel: res.matchLevel,
-          score: res.score,
-          reason: res.reason,
-          keyFactors: res.keyFactors,
-          createdAt: matchObj.createdAt
+          lostItemId: matchData.lostItemId,
+          foundItemId: matchData.foundItemId,
+          matchLevel: matchData.matchLevel,
+          score: matchData.score,
+          reason: matchData.reason,
+          keyFactors: matchData.keyFactors,
+          createdAt: matchData.createdAt
         }));
 
-        const updateItemStatus = async (item: CampusItem, matchedWithId: string) => {
-          const matchedItemIds = Array.from(new Set([...(item.matchedItemIds || []), matchedWithId]));
-          await updateDoc(doc(db, "items", item.id), sanitizePayload({
-            status: item.status === "returned" ? "returned" : "possible_match",
-            matchedItemIds
-          }));
-        };
+        const lostMatched = Array.from(new Set([...(lostItem.matchedItemIds || []), foundItem.id]));
+        const foundMatched = Array.from(new Set([...(foundItem.matchedItemIds || []), lostItem.id]));
 
-        await updateItemStatus(lostItem, foundItem.id);
-        await updateItemStatus(foundItem, lostItem.id);
+        await updateDoc(doc(db, "items", lostItem.id), sanitizePayload({
+          status: "possible_match",
+          matchedItemIds: lostMatched
+        }));
 
-        matches.push(matchObj);
+        await updateDoc(doc(docSnap => docSnap, "items", foundItem.id), sanitizePayload({
+          status: "possible_match",
+          matchedItemIds: foundMatched
+        }));
+
+        createdMatches.push(matchData);
       } catch (err) {
-        console.error("Error saving match:", err);
+        console.error(`[FindBack AI] Error storing match ${matchId}:`, err);
       }
     }
   }
 
-  return { matches, aiUnavailable };
+  return { matches: createdMatches, aiUnavailable };
 }
 
-async function createServer() {
+// Start Express Server with Vite middleware
+async function startServer() {
   const app = express();
-  const PORT = Number(process.env.PORT) || 3000;
+  const PORT = process.env.PORT || 3000;
 
   app.use(express.json({ limit: "10mb" }));
 
@@ -611,32 +614,33 @@ async function createServer() {
     try {
       const items = await fetchItemsFromFirestore();
       res.json(items);
-    } catch (err) {
-      res.status(500).json({ error: "Failed to fetch items" });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || "Failed to fetch items" });
     }
   });
 
   app.post("/api/items", async (req, res) => {
     try {
-      const body = req.body;
-      const itemId = body.id || `item_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const itemData = req.body;
+      const itemId = itemData.id || `item_${Date.now()}`;
       const newItem: CampusItem = {
         id: itemId,
-        itemType: body.itemType,
-        itemName: body.itemName,
-        category: body.category || "Other",
-        description: body.description || "",
-        color: body.color || "Not specified",
-        location: body.location || "",
-        date: body.date || new Date().toISOString().split("T")[0],
-        imageUrl: body.imageUrl || undefined,
-        contact: body.contact || "",
-        status: body.status || body.itemType,
+        itemType: itemData.itemType,
+        itemName: itemData.itemName,
+        category: itemData.category || "Other",
+        description: itemData.description || "",
+        color: itemData.color || "Not specified",
+        location: itemData.location || "",
+        date: itemData.date || new Date().toISOString().split("T")[0],
+        imageUrl: itemData.imageUrl || undefined,
+        contact: itemData.contact || "",
+        status: itemData.itemType,
         createdAt: new Date().toISOString(),
         matchedItemIds: []
       };
 
-      await setDoc(doc(db, "items", itemId), sanitizePayload(newItem));
+      await setDoc(doc(db, "items", newItem.id), sanitizePayload(newItem));
+
       const evalResult = await evaluateItemAgainstFirestore(newItem);
 
       res.status(201).json({
@@ -654,51 +658,48 @@ async function createServer() {
     try {
       const matches = await fetchMatchesFromFirestore();
       res.json(matches);
-    } catch (err) {
-      res.status(500).json({ error: "Failed to fetch matches" });
-    }
-  });
-
-  app.patch("/api/items/:id/status", async (req, res) => {
-    try {
-      const { id } = req.params;
-      const { status } = req.body;
-      await updateDoc(doc(db, "items", id), sanitizePayload({ status }));
-      res.json({ success: true, id, status });
     } catch (err: any) {
-      res.status(500).json({ error: err.message || "Failed to update item status" });
+      res.status(500).json({ error: err.message || "Failed to fetch matches" });
     }
   });
 
-  // Vite development or static file serving
+  app.post("/api/evaluate/:itemId", async (req, res) => {
+    try {
+      const { itemId } = req.params;
+      const items = await fetchItemsFromFirestore();
+      const targetItem = items.find(i => i.id === itemId);
+
+      if (!targetItem) {
+        return res.status(404).json({ error: "Item not found" });
+      }
+
+      const evalResult = await evaluateItemAgainstFirestore(targetItem);
+      res.json(evalResult);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || "Failed to evaluate item" });
+    }
+  });
+
+  // Vite development integration or static serving
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
-      appType: "custom",
+      appType: "spa",
     });
     app.use(vite.middlewares);
-    app.use("*", async (req, res, next) => {
-      const url = req.originalUrl;
-      try {
-        let template = fs.readFileSync(path.resolve(".", "index.html"), "utf-8");
-        template = await vite.transformIndexHtml(url, template);
-        res.status(200).set({ "Content-Type": "text/html" }).end(template);
-      } catch (e: any) {
-        vite.ssrFixStacktrace(e);
-        next(e);
-      }
-    });
   } else {
-    const distPath = path.resolve(".", "dist");
-    app.use(express.static(distPath));
-    app.use("*", (_req, res) => {
-      res.sendFile(path.resolve(distPath, "index.html"));
-    });
+    const distPath = path.resolve(__dirname, "dist");
+    if (fs.existsSync(distPath)) {
+      app.use(express.static(distPath));
+      app.get("*", (_req, res) => {
+        res.sendFile(path.resolve(distPath, "index.html"));
+      });
+    }
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  app.listen(PORT, () => {
     console.log(`[FindBack AI Server] Running on http://localhost:${PORT}`);
   });
 }
 
-createServer();
+startServer();
